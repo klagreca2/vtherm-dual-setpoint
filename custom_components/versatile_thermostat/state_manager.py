@@ -33,7 +33,7 @@ from .const import (
     MSG_TARGET_TEMP_TIMED_PRESET,
 )
 from .vtherm_state import VThermState
-from .vtherm_hvac_mode import VThermHvacMode_OFF, VThermHvacMode_FAN_ONLY, VThermHvacMode_COOL, VThermHvacMode_HEAT, VThermHvacMode_SLEEP
+from .vtherm_hvac_mode import VThermHvacMode_OFF, VThermHvacMode_FAN_ONLY, VThermHvacMode_COOL, VThermHvacMode_HEAT, VThermHvacMode_HEAT_COOL, VThermHvacMode_SLEEP
 from .vtherm_preset import VThermPreset
 
 _LOGGER = get_vtherm_logger(__name__)
@@ -229,6 +229,17 @@ class StateManager:
         Returns:
             bool: True or False according to rules to be preceeding rules
         """
+
+        # Dual-setpoint fork: in HEAT_COOL passthrough mode we don't run the
+        # single-setpoint preset/window/presence temperature logic. We simply
+        # carry the requested high/low setpoints into the current state; the
+        # underlying climate device handles the deadband.
+        if vtherm.vtherm_hvac_mode == VThermHvacMode_HEAT_COOL:
+            self._current_state.set_target_temperature_range(
+                self._requested_state.target_temperature_high,
+                self._requested_state.target_temperature_low,
+            )
+            return self._current_state.is_target_temperature_changed
 
         updated = False
         window_action = vtherm.window_manager.window_action

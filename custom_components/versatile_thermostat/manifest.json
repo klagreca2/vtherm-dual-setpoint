@@ -10,11 +10,11 @@
   ],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/jmcollin78/versatile_thermostat",
+  "documentation": "https://github.com/klagreca2/vtherm-dual-setpoint",
   "homekit": {},
   "integration_type": "device",
   "iot_class": "calculated",
-  "issue_tracker": "https://github.com/jmcollin78/versatile_thermostat/issues",
+  "issue_tracker": "https://github.com/klagreca2/vtherm-dual-setpoint/issues",
   "quality_scale": "silver",
   "requirements": [
     "numpy",
@@ -22,6 +22,6 @@
     "vtherm_api>=0.3.0"
   ],
   "ssdp": [],
-  "version": "10.0.1",
+  "version": "10.0.1+dualsetpoint.1",
   "zeroconf": []
 }

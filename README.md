@@ -6,6 +6,12 @@
 
 # Versatile Thermostat
 
+> **⚠️ This is a fork** of [jmcollin78/versatile_thermostat](https://github.com/jmcollin78/versatile_thermostat) that adds **dual-setpoint (HEAT_COOL) passthrough** for `over_climate` thermostats.
+>
+> When the VTherm is set to `heat_cool`, the `target_temp_high` / `target_temp_low` setpoints are forwarded directly to the underlying climate device (e.g. AirZone), which manages the heat/cool deadband natively. VTherm's single-setpoint regulation and presets continue to apply in `heat`/`cool` modes exactly as upstream. See `documentation/en/dual-setpoint.md`.
+>
+> Domain is unchanged (`versatile_thermostat`) — install **either** this fork or upstream, not both. For all other features and configuration, the upstream documentation below applies.
+
 This README file is available in
 languages : [English](README.md) | [Français](README-fr.md) | [Deutsch](README-de.md) | [Čeština](README-cs.md) | [Polski](README-pl.md)
 <div> <br> </div>

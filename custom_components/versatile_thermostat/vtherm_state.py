@@ -25,12 +25,22 @@ class VThermState:
     attributes individually via properties. to_dict / from_dict help (de)serialization.
     """
 
-    def __init__(self, hvac_mode: Any, target_temperature: Optional[float] = None, preset: Optional[VThermPreset] = None) -> None:
+    def __init__(
+        self,
+        hvac_mode: Any,
+        target_temperature: Optional[float] = None,
+        preset: Optional[VThermPreset] = None,
+        target_temperature_high: Optional[float] = None,
+        target_temperature_low: Optional[float] = None,
+    ) -> None:
         if preset is not None and not isinstance(preset, str):
             raise ValueError(f"Invalid preset: {preset}. Should be an instance of VThermPreset.")
 
         self._hvac_mode: VThermHvacMode = hvac_mode if isinstance(hvac_mode, VThermHvacMode) else VThermHvacMode(str(hvac_mode))
         self._target_temperature: Optional[float] = target_temperature
+        # Dual setpoint (used only in HEAT_COOL passthrough mode). None otherwise.
+        self._target_temperature_high: Optional[float] = target_temperature_high
+        self._target_temperature_low: Optional[float] = target_temperature_low
         self._preset: Optional[VThermPreset] = preset
         self._is_hvac_mode_changed: bool = True
         self._is_target_temperature_changed: bool = True
@@ -41,6 +51,8 @@ class VThermState:
         hvac_mode: Optional[VThermHvacMode] = None,
         target_temperature: Optional[float] = None,
         preset: Optional[VThermPreset] = None,
+        target_temperature_high: Optional[float] = None,
+        target_temperature_low: Optional[float] = None,
     ) -> None:
         """Update only the attributes provided (not None).
 
@@ -48,11 +60,15 @@ class VThermState:
             hvac_mode: New HVAC mode to set (if not None).
             target_temperature: New target temperature (if not None).
             preset: New preset (if not None).
+            target_temperature_high: New high-bound target temperature (if not None).
+            target_temperature_low: New low-bound target temperature (if not None).
         """
         if hvac_mode is not None:
             self.set_hvac_mode(hvac_mode)
         if target_temperature is not None:
             self.set_target_temperature(target_temperature)
+        if target_temperature_high is not None or target_temperature_low is not None:
+            self.set_target_temperature_range(target_temperature_high, target_temperature_low)
         if preset is not None:
             self.set_preset(preset)
 
@@ -76,6 +92,28 @@ class VThermState:
         """
         self._is_target_temperature_changed = self._is_target_temperature_changed or self._target_temperature != target_temperature
         self._target_temperature = target_temperature
+
+    def set_target_temperature_range(
+        self,
+        target_temperature_high: Optional[float],
+        target_temperature_low: Optional[float],
+    ) -> None:
+        """Set the dual setpoint (high/low) target temperatures.
+
+        Used for HEAT_COOL passthrough. Any change is folded into the
+        existing target-temperature change flag so the regular update path
+        picks it up.
+
+        Args:
+            target_temperature_high: New high-bound target temperature, or None to leave unchanged.
+            target_temperature_low: New low-bound target temperature, or None to leave unchanged.
+        """
+        if target_temperature_high is not None:
+            self._is_target_temperature_changed = self._is_target_temperature_changed or self._target_temperature_high != target_temperature_high
+            self._target_temperature_high = target_temperature_high
+        if target_temperature_low is not None:
+            self._is_target_temperature_changed = self._is_target_temperature_changed or self._target_temperature_low != target_temperature_low
+            self._target_temperature_low = target_temperature_low
 
     def set_preset(self, preset: Optional[VThermPreset]) -> None:
         """Set the preset only.
@@ -104,6 +142,16 @@ class VThermState:
     def target_temperature(self) -> Optional[float]:
         """Get or set the current target temperature."""
         return self._target_temperature
+
+    @property
+    def target_temperature_high(self) -> Optional[float]:
+        """Get the current high-bound target temperature (HEAT_COOL)."""
+        return self._target_temperature_high
+
+    @property
+    def target_temperature_low(self) -> Optional[float]:
+        """Get the current low-bound target temperature (HEAT_COOL)."""
+        return self._target_temperature_low
 
     @property
     def preset(self) -> Optional[VThermPreset]:
@@ -141,6 +189,8 @@ class VThermState:
         return {
             "hvac_mode": str(self._hvac_mode),
             "target_temperature": self._target_temperature,
+            "target_temperature_high": self._target_temperature_high,
+            "target_temperature_low": self._target_temperature_low,
             "preset": str(self._preset),
         }
 
@@ -150,12 +200,26 @@ class VThermState:
         hvac_mode = VThermHvacMode(data["hvac_mode"])
         target_temperature = data["target_temperature"]
         preset = VThermPreset(data["preset"]) if data["preset"] else None
-        state = cls(hvac_mode, target_temperature, preset)
+        state = cls(
+            hvac_mode,
+            target_temperature,
+            preset,
+            data.get("target_temperature_high"),
+            data.get("target_temperature_low"),
+        )
         return state
 
     def __str__(self) -> str:
         """Return a human readable representation of the state."""
-        return f"VThermState(" f"hvac_mode={self._hvac_mode}, " f"target_temperature={self._target_temperature}, " f"preset={self._preset}, " f"is_changed={self.is_changed})"
+        return (
+            f"VThermState("
+            f"hvac_mode={self._hvac_mode}, "
+            f"target_temperature={self._target_temperature}, "
+            f"target_temperature_high={self._target_temperature_high}, "
+            f"target_temperature_low={self._target_temperature_low}, "
+            f"preset={self._preset}, "
+            f"is_changed={self.is_changed})"
+        )
 
     __repr__ = __str__
 
@@ -171,7 +235,13 @@ class VThermState:
         if not isinstance(other, VThermState):
             return False
 
-        return self._hvac_mode == other._hvac_mode and self._target_temperature == other._target_temperature and self._preset == other._preset
+        return (
+            self._hvac_mode == other._hvac_mode
+            and self._target_temperature == other._target_temperature
+            and self._target_temperature_high == other._target_temperature_high
+            and self._target_temperature_low == other._target_temperature_low
+            and self._preset == other._preset
+        )
 
     def __ne__(self, other: object) -> bool:
         """Compare two VThermState instances for inequality."""

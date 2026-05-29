@@ -585,6 +585,9 @@ class UnderlyingClimate(UnderlyingEntity):
             entity_id=climate_entity_id,
         )
         self._last_sent_temperature: Optional[float] = None
+        # Dual-setpoint fork: last high/low sent in HEAT_COOL passthrough (for change detection)
+        self._last_sent_temp_high: Optional[float] = None
+        self._last_sent_temp_low: Optional[float] = None
         self._cancel_set_fan_mode_later: Optional[Callable[[], None]] = None
         self._cancel_set_temperature_later: Optional[Callable[[], None]] = None
         self._min_sync_entity: float = None
@@ -627,6 +630,20 @@ class UnderlyingClimate(UnderlyingEntity):
             if self._cancel_set_temperature_later:
                 self._cancel_set_temperature_later()
             self._cancel_set_temperature_later = async_call_later(self._hass, resend_delay_sec, callback_resend_temp)
+
+        # Dual-setpoint fork: resend the high/low range when (re)entering HEAT_COOL
+        elif hvac_mode == VThermHvacMode_HEAT_COOL:
+            current_state = self._thermostat.requested_state
+
+            async def callback_resend_range(_):
+                await self.set_temperature_range(
+                    current_state.target_temperature_high,
+                    current_state.target_temperature_low,
+                )
+
+            if self._cancel_set_temperature_later:
+                self._cancel_set_temperature_later()
+            self._cancel_set_temperature_later = async_call_later(self._hass, resend_delay_sec, callback_resend_range)
 
         return True
 
@@ -884,6 +901,54 @@ class UnderlyingClimate(UnderlyingEntity):
 
         self._last_sent_temperature = target_temp
         _LOGGER.debug("%s - Last_sent_temperature is now: %s", self, self._last_sent_temperature)
+
+    async def set_temperature_range(self, temp_high, temp_low):
+        """Set dual setpoints (HEAT_COOL passthrough).
+
+        Sends target_temp_high/target_temp_low straight to the underlying climate
+        without applying any regulation/offset. Requires the underlying to support
+        TARGET_TEMPERATURE_RANGE; otherwise falls back to a single setpoint using
+        the available bound.
+        """
+        if not self.is_initialized:
+            return
+
+        # If the underlying does not support a range, degrade to single setpoint.
+        if ClimateEntityFeature.TARGET_TEMPERATURE_RANGE not in self.supported_features:
+            fallback = temp_high if temp_high is not None else temp_low
+            if fallback is not None:
+                await self.set_temperature(fallback, None, None)
+            return
+
+        clamped_high = self.clamp_sent_value(temp_high) if temp_high is not None else None
+        clamped_low = self.clamp_sent_value(temp_low) if temp_low is not None else None
+
+        # Skip the service call if nothing changed since the last send. The control
+        # cycle calls this every tick; the underlying handles the deadband itself.
+        if clamped_high == self._last_sent_temp_high and clamped_low == self._last_sent_temp_low:
+            _LOGGER.debug("%s - dual setpoints unchanged (high=%s low=%s). Skip send.", self, clamped_high, clamped_low)
+            return
+
+        data = {ATTR_ENTITY_ID: self._entity_id}
+        if clamped_high is not None:
+            data["target_temp_high"] = clamped_high
+        if clamped_low is not None:
+            data["target_temp_low"] = clamped_low
+
+        _LOGGER.info("%s - Set dual setpoints: %s", self, data)
+
+        try:
+            await self.hass_services_async_call(
+                CLIMATE_DOMAIN,
+                SERVICE_SET_TEMPERATURE,
+                data,
+            )
+        except Exception as ex:
+            _LOGGER.error("%s - Error while sending set_temperature_range: %s", self, ex)
+            raise ex
+
+        self._last_sent_temp_high = clamped_high
+        self._last_sent_temp_low = clamped_low
 
     @property
     def last_sent_temperature(self) -> float | None:

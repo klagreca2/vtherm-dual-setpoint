@@ -35,6 +35,8 @@ from homeassistant.helpers.event import (
 
 from homeassistant.components.climate.const import (
     ATTR_PRESET_MODE,
+    ATTR_TARGET_TEMP_HIGH,
+    ATTR_TARGET_TEMP_LOW,
     # ATTR_FAN_MODE,
     HVACMode,
     HVACAction,
@@ -1440,6 +1442,18 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
     async def async_set_temperature(self, **kwargs):
         """Set new requested target temperature and turn off any active presets."""
         temperature = kwargs.get(ATTR_TEMPERATURE)
+        temp_high = kwargs.get(ATTR_TARGET_TEMP_HIGH)
+        temp_low = kwargs.get(ATTR_TARGET_TEMP_LOW)
+
+        # Dual-setpoint fork: HEAT_COOL passthrough. HA sends target_temp_high/low
+        # (not ATTR_TEMPERATURE) when the entity is in a range/heat_cool mode.
+        if temp_high is not None or temp_low is not None:
+            write_event_log(_LOGGER, self, f"Set target temp range: low={temp_low} high={temp_high}")
+            self._state_manager.requested_state.set_target_temperature_range(temp_high, temp_low)
+            self._state_manager.requested_state.set_preset(VThermPreset.NONE)
+            await self.update_states(force=True)
+            return
+
         write_event_log(_LOGGER, self, f"Set target temp: {temperature}")
         if temperature is None:
             return
@@ -1526,6 +1540,10 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
                 if self._state_manager.current_state.is_target_temperature_changed:
                     _LOGGER.info("%s - Applying new target temperature: %s", self, self.target_temperature)
                     self._attr_target_temperature = self.target_temperature
+                    # Dual-setpoint fork: reflect the high/low bounds on the entity state
+                    # so the UI/scheduler see them (HEAT_COOL passthrough).
+                    self._attr_target_temperature_high = self._state_manager.current_state.target_temperature_high
+                    self._attr_target_temperature_low = self._state_manager.current_state.target_temperature_low
                     # Reset auto_start_stop switch delay to allow immediate restart when target temp changes
                     if self.auto_start_stop_manager:
                         self.auto_start_stop_manager.reset_switch_delay()

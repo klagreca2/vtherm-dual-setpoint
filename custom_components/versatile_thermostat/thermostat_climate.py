@@ -166,6 +166,14 @@ class ThermostatOverClimate(BaseThermostat[UnderlyingClimate]):
             self._last_regulation_change = self.now
             return
 
+        # Dual-setpoint fork: in HEAT_COOL mode VTherm does not run its single-setpoint
+        # regulation. We pass the high/low setpoints straight through to the underlying
+        # climate, which handles the heat/cool deadband itself (e.g. AirZone).
+        if self.vtherm_hvac_mode == VThermHvacMode_HEAT_COOL:
+            await self._send_heat_cool_setpoints()
+            self._last_regulation_change = self.now
+            return
+
         if self.target_temperature is None:
             _LOGGER.warning(
                 "%s - don't send regulated temperature cause VTherm target_temp (%s) is None. This should be a temporary warning message.",
@@ -265,6 +273,32 @@ class ThermostatOverClimate(BaseThermostat[UnderlyingClimate]):
 
         # Update regulated_target_temp after the loop to avoid affecting dtemp calculation for other underlyings
         self._regulated_target_temp = new_regulated_temp
+
+    async def _send_heat_cool_setpoints(self):
+        """Forward the HEAT_COOL high/low setpoints directly to the underlyings.
+
+        No regulation/offset is applied: the underlying climate device manages
+        the heat/cool deadband natively. Falls back gracefully when one bound
+        is missing.
+        """
+        state = self._state_manager.current_state
+        temp_high = state.target_temperature_high
+        temp_low = state.target_temperature_low
+
+        if temp_high is None and temp_low is None:
+            _LOGGER.debug(
+                "%s - HEAT_COOL but no high/low setpoint known yet. Skip sending.", self
+            )
+            return
+
+        _LOGGER.info(
+            "%s - HEAT_COOL passthrough: sending high=%s low=%s to underlyings",
+            self,
+            temp_high,
+            temp_low,
+        )
+        for under in self._underlyings:
+            await under.set_temperature_range(temp_high, temp_low)
 
     def do_send_regulated_temp_later(self):
         """A utility function to set the temperature later on an underlying"""
@@ -988,14 +1022,15 @@ class ThermostatOverClimate(BaseThermostat[UnderlyingClimate]):
     def build_hvac_list(self) -> list[VThermHvacMode]:
         """Build the hvac list depending on ac_mode"""
         if self.underlying_entity(0):
-            # replace HEAT_COOL by heat and cool
-            result = under_hvac_modes = self.underlying_entity(0).hvac_modes
+            # Dual-setpoint fork: keep HEAT_COOL when the underlying exposes it so
+            # VTherm can pass target_temp_high/target_temp_low straight through.
+            # We also make sure both HEAT and COOL are individually available.
+            result = under_hvac_modes = list(self.underlying_entity(0).hvac_modes)
             if VThermHvacMode_HEAT_COOL in under_hvac_modes:
-                result = [mode for mode in under_hvac_modes if mode != VThermHvacMode_HEAT_COOL]
-                if VThermHvacMode_HEAT not in under_hvac_modes:
-                    result.extend([VThermHvacMode_HEAT])
-                if VThermHvacMode_COOL not in under_hvac_modes:
-                    result.extend([VThermHvacMode_COOL])
+                if VThermHvacMode_HEAT not in result:
+                    result.append(VThermHvacMode_HEAT)
+                if VThermHvacMode_COOL not in result:
+                    result.append(VThermHvacMode_COOL)
 
             return result
 
@@ -1089,7 +1124,13 @@ class ThermostatOverClimate(BaseThermostat[UnderlyingClimate]):
         """Return the highbound target temperature we try to reach.
 
         Requires ClimateEntityFeature.TARGET_TEMPERATURE_RANGE.
+
+        In HEAT_COOL passthrough mode the value tracked by VTherm's state is
+        authoritative; otherwise fall back to the underlying device value.
         """
+        state_high = self._state_manager.current_state.target_temperature_high
+        if state_high is not None:
+            return state_high
         if self.underlying_entity(0):
             return self.underlying_entity(0).target_temperature_high
 
@@ -1100,7 +1141,13 @@ class ThermostatOverClimate(BaseThermostat[UnderlyingClimate]):
         """Return the lowbound target temperature we try to reach.
 
         Requires ClimateEntityFeature.TARGET_TEMPERATURE_RANGE.
+
+        In HEAT_COOL passthrough mode the value tracked by VTherm's state is
+        authoritative; otherwise fall back to the underlying device value.
         """
+        state_low = self._state_manager.current_state.target_temperature_low
+        if state_low is not None:
+            return state_low
         if self.underlying_entity(0):
             return self.underlying_entity(0).target_temperature_low
 
