@@ -1120,14 +1120,29 @@ class ThermostatOverClimate(BaseThermostat[UnderlyingClimate]):
         return self._support_flags
 
     @property
+    def target_temperature(self) -> float | None:
+        """Return the single target temperature we try to reach.
+
+        Dual-setpoint fork: in HEAT_COOL mode the entity uses the high/low
+        range instead, so the single setpoint must be None — otherwise the
+        frontend keeps rendering a single slider in heat_cool (mirrors how
+        native dual-setpoint climates report ``temperature`` as None).
+        """
+        if self.vtherm_hvac_mode == VThermHvacMode_HEAT_COOL:
+            return None
+        return self._state_manager.current_state.target_temperature
+
+    @property
     def target_temperature_high(self) -> float | None:
         """Return the highbound target temperature we try to reach.
 
-        Requires ClimateEntityFeature.TARGET_TEMPERATURE_RANGE.
-
-        In HEAT_COOL passthrough mode the value tracked by VTherm's state is
-        authoritative; otherwise fall back to the underlying device value.
+        Requires ClimateEntityFeature.TARGET_TEMPERATURE_RANGE. Only meaningful
+        in HEAT_COOL mode; None otherwise so the frontend shows a single slider
+        in heat/cool. VTherm's tracked state is authoritative, falling back to
+        the underlying device value.
         """
+        if self.vtherm_hvac_mode != VThermHvacMode_HEAT_COOL:
+            return None
         state_high = self._state_manager.current_state.target_temperature_high
         if state_high is not None:
             return state_high
@@ -1140,11 +1155,13 @@ class ThermostatOverClimate(BaseThermostat[UnderlyingClimate]):
     def target_temperature_low(self) -> float | None:
         """Return the lowbound target temperature we try to reach.
 
-        Requires ClimateEntityFeature.TARGET_TEMPERATURE_RANGE.
-
-        In HEAT_COOL passthrough mode the value tracked by VTherm's state is
-        authoritative; otherwise fall back to the underlying device value.
+        Requires ClimateEntityFeature.TARGET_TEMPERATURE_RANGE. Only meaningful
+        in HEAT_COOL mode; None otherwise so the frontend shows a single slider
+        in heat/cool. VTherm's tracked state is authoritative, falling back to
+        the underlying device value.
         """
+        if self.vtherm_hvac_mode != VThermHvacMode_HEAT_COOL:
+            return None
         state_low = self._state_manager.current_state.target_temperature_low
         if state_low is not None:
             return state_low

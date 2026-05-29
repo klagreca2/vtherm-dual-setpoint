@@ -599,6 +599,8 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
                     hvac_mode=current_state.hvac_mode,
                     target_temperature=current_state.target_temperature,
                     preset=current_state.preset,
+                    target_temperature_high=current_state.target_temperature_high,
+                    target_temperature_low=current_state.target_temperature_low,
                 )
             else:
                 # Try to init current_state with old temperature, preset and mode
@@ -623,6 +625,8 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
                     hvac_mode=requested_state.hvac_mode,
                     target_temperature=requested_state.target_temperature,
                     preset=requested_state.preset,
+                    target_temperature_high=requested_state.target_temperature_high,
+                    target_temperature_low=requested_state.target_temperature_low,
                 )
             else:
                 # Try to init requested_state with old temperature, preset and mode
