@@ -131,3 +131,4 @@ dev_tests/
 entities.json
 .codex
 mempalace.yaml
+.DS_Store
