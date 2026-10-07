@@ -8,6 +8,11 @@ homeassistant:
 system_health:
 energy:
 
+# Demo integration: provides the `climate.hvac` entity which supports the
+# `off`, `heat`, `cool`, `auto`, `dry` and `fan_only` modes. Use it as the
+# underlying of an over_climate VTherm to test the auto-start/stop stop mode.
+demo:
+
 recorder:
     auto_purge: true
     purge_keep_days: 1
@@ -29,6 +34,8 @@ logger:
     default: warning
     logs:
         custom_components.versatile_thermostat: debug
+        custom_components.vtherm_auto_fan_extended: debug
+        custom_components.vtherm_heating_failure_detection: debug
 
 # If you need to debug uncommment the line below (doc: https://www.home-assistant.io/integrations/debugpy/)
 debugpy:
@@ -90,14 +97,14 @@ input_number:
         max: 1000
         step: 10
         icon: mdi:flash
-        unit_of_measurement: kW
+        unit_of_measurement: W
     fake_current_power_max:
         name: Current power max threshold
         min: 0
         max: 1000
         step: 10
         icon: mdi:flash
-        unit_of_measurement: kW
+        unit_of_measurement: W
     fake_valve1:
         name: The valve 1
         min: 10

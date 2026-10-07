@@ -8,7 +8,7 @@ from typing import Literal
 from datetime import datetime
 
 from enum import Enum
-from homeassistant.const import STATE_UNKNOWN, STATE_UNAVAILABLE
+from homeassistant.const import STATE_UNKNOWN, STATE_UNAVAILABLE, UnitOfPower
 from homeassistant.core import HomeAssistant
 from homeassistant.const import CONF_NAME, Platform
 
@@ -41,7 +41,7 @@ from .vtherm_state import VThermState  # pylint: disable=unused-import
 _LOGGER = get_vtherm_logger(__name__)
 
 CONFIG_VERSION = 2
-CONFIG_MINOR_VERSION = 3
+CONFIG_MINOR_VERSION = 4
 
 DEVICE_MANUFACTURER = "JMCOLLIN"
 DEVICE_MODEL = "Versatile Thermostat"
@@ -50,18 +50,21 @@ DOMAIN = "versatile_thermostat"
 
 # The order is important.
 PLATFORMS: list[Platform] = [
-    Platform.SELECT,
     Platform.CLIMATE,
     Platform.SENSOR,
     # Number should be after CLIMATE
     Platform.NUMBER,
     Platform.BINARY_SENSOR,
     Platform.SWITCH,
+    # Select should be after CLIMATE
+    Platform.SELECT,
 ]
 
 CONF_UNDERLYING_LIST = "underlying_entity_ids"
 CONF_HEATER_KEEP_ALIVE = "heater_keep_alive"
 CONF_TEMP_SENSOR = "temperature_sensor_entity_id"
+CONF_HUMIDITY_SENSOR = "humidity_sensor_entity_id"
+CONF_USE_HUMIDITY_FEATURE = "use_humidity_feature"
 CONF_LAST_SEEN_TEMP_SENSOR = "last_seen_temperature_sensor_entity_id"
 CONF_EXTERNAL_TEMP_SENSOR = "external_temperature_sensor_entity_id"
 CONF_POWER_SENSOR = "power_sensor_entity_id"
@@ -69,6 +72,21 @@ CONF_MAX_POWER_SENSOR = "max_power_sensor_entity_id"
 CONF_WINDOW_SENSOR = "window_sensor_entity_id"
 CONF_MOTION_SENSOR = "motion_sensor_entity_id"
 CONF_DEVICE_POWER = "device_power"
+CONF_POWER_UNIT = "power_unit"
+
+# Power unit values used by configuration selector translation keys.
+# Convert them to Home Assistant's "W" / "kW" values only at entity boundaries.
+POWER_UNIT_WATT = "w"
+POWER_UNIT_KILO_WATT = "kw"
+POWER_UNIT_MEGA_WATT = "mw"
+POWER_UNIT_AUTO = "auto"
+
+# Selector options
+CONF_POWER_UNITS = [POWER_UNIT_WATT, POWER_UNIT_KILO_WATT]
+CONF_CENTRAL_POWER_UNITS = [POWER_UNIT_WATT, POWER_UNIT_KILO_WATT, POWER_UNIT_AUTO]
+
+# Threshold used by the legacy unit heuristic and by the config migration
+THRESHOLD_POWER_WATT_KILO = 100
 CONF_CYCLE_MIN = "cycle_min"
 CONF_PROP_FUNCTION = "proportional_function"
 CONF_WINDOW_DELAY = "window_delay"
@@ -244,7 +262,18 @@ TYPE_AUTO_START_STOP_LEVELS = Literal[  # pylint: disable=invalid-name
     AUTO_START_STOP_LEVEL_NONE,
 ]
 
+# The hvac_mode applied when the auto-start/stop feature detects a stop condition
+AUTO_START_STOP_STOP_MODE_OFF = str(VThermHvacMode_OFF)
+AUTO_START_STOP_STOP_MODE_FAN_ONLY = str(VThermHvacMode_FAN_ONLY)
+AUTO_START_STOP_STOP_MODE_DRY = str(VThermHvacMode_DRY)
+AUTO_START_STOP_STOP_MODES = [
+    AUTO_START_STOP_STOP_MODE_OFF,
+    AUTO_START_STOP_STOP_MODE_FAN_ONLY,
+    AUTO_START_STOP_STOP_MODE_DRY,
+]
+
 HVAC_OFF_REASON_NAME = "hvac_off_reason"
+HVAC_MODE_REASON_NAME = "hvac_mode_reason"
 HVAC_OFF_REASON_MANUAL = "hvac_off_manual"
 HVAC_OFF_REASON_AUTO_START_STOP = "hvac_off_auto_start_stop"
 HVAC_OFF_REASON_WINDOW_DETECTION = "hvac_off_window_detection"
@@ -254,6 +283,15 @@ HVAC_OFF_REASON_CENTRAL_MODE = "hvac_off_central_mode"
 HVAC_OFF_REASONS = Literal[  # pylint: disable=invalid-name
     HVAC_OFF_REASON_MANUAL, HVAC_OFF_REASON_AUTO_START_STOP, HVAC_OFF_REASON_WINDOW_DETECTION, HVAC_OFF_REASON_SLEEP_MODE, HVAC_OFF_REASON_SAFETY
 ]
+
+# The hvac_mode_reason set when the auto-start/stop feature applies a non-off stop mode
+HVAC_MODE_REASON_AUTO_START_STOP_FAN_ONLY = "hvac_fan_only_auto_start_stop"
+HVAC_MODE_REASON_AUTO_START_STOP_DRY = "hvac_dry_auto_start_stop"
+# Maps the stop mode applied by the auto-start/stop feature to the related hvac_mode_reason
+AUTO_START_STOP_HVAC_MODE_REASONS = {
+    AUTO_START_STOP_STOP_MODE_FAN_ONLY: HVAC_MODE_REASON_AUTO_START_STOP_FAN_ONLY,
+    AUTO_START_STOP_STOP_MODE_DRY: HVAC_MODE_REASON_AUTO_START_STOP_DRY,
+}
 
 DEFAULT_SHORT_EMA_PARAMS = {
     "max_alpha": 0.5,
@@ -339,6 +377,7 @@ ALL_CONF = (
         CONF_MOTION_PRESET,
         CONF_NO_MOTION_PRESET,
         CONF_DEVICE_POWER,
+        CONF_POWER_UNIT,
         CONF_CYCLE_MIN,
         CONF_PROP_FUNCTION,
         CONF_TPI_COEF_INT,
@@ -499,10 +538,11 @@ DEFAULT_HEATING_FAILURE_DETECTION_DELAY = 15  # 15 minutes
 DEFAULT_TEMPERATURE_CHANGE_TOLERANCE = 0.5  # 0.5°C
 
 ATTR_TOTAL_ENERGY = "total_energy"
+ATTR_TOTAL_ENERGY_UNIT = "total_energy_unit"
 ATTR_MEAN_POWER_CYCLE = "mean_cycle_power"
 
 AUTO_FAN_DTEMP_THRESHOLD = 2
-AUTO_FAN_DEACTIVATED_MODES = ["mute", "quiet", "low", "quiet", "1", "auto"]
+AUTO_FAN_DEACTIVATED_MODES = ["mute", "quiet", "low", "quiet", "1", "one", "speed_1", "auto"]
 
 CENTRAL_CONFIG_NAME = "Central configuration"
 
@@ -628,6 +668,54 @@ def get_safe_float_value(value):
         return None
 
 
+def power_to_watts(value: float | None, unit: str | None) -> float | None:
+    """Normalize a power (or energy) magnitude to Watts (or Watt-hours).
+    The conversion accepts internal selector keys and Home Assistant units."""
+
+    if value is None:
+        return None
+    if to_internal_power_unit(unit) == POWER_UNIT_KILO_WATT:
+        return value * 1000.0
+    return value
+
+
+def power_from_watts(value_w: float | None, unit: str | None) -> float | None:
+    """Convert a Watts (or Watt-hours) magnitude to the target power unit.
+
+    The conversion accepts internal selector keys and Home Assistant units.
+    """
+
+    if value_w is None:
+        return None
+    if to_internal_power_unit(unit) == POWER_UNIT_KILO_WATT:
+        return value_w / 1000.0
+    return value_w
+
+
+def to_internal_power_unit(power_unit: str | None) -> str | None:
+    """Map a selector key or Home Assistant power unit to its internal key."""
+    power_unit_mapping = {
+        POWER_UNIT_WATT: POWER_UNIT_WATT,
+        UnitOfPower.WATT: POWER_UNIT_WATT,
+        POWER_UNIT_KILO_WATT: POWER_UNIT_KILO_WATT,
+        UnitOfPower.KILO_WATT: POWER_UNIT_KILO_WATT,
+        POWER_UNIT_MEGA_WATT: POWER_UNIT_MEGA_WATT,
+        UnitOfPower.MEGA_WATT: POWER_UNIT_MEGA_WATT,
+    }
+    return power_unit_mapping.get(power_unit, power_unit)
+
+
+def to_legal_power_unit(power_unit: str) -> str:
+    """Map the power unit from the thermostat to Home Assistant's expected unit."""
+    power_unit_mapping: dict[str, str] = {
+        POWER_UNIT_WATT: UnitOfPower.WATT,
+        POWER_UNIT_KILO_WATT: UnitOfPower.KILO_WATT,
+        POWER_UNIT_MEGA_WATT: UnitOfPower.MEGA_WATT,
+    }
+    internal_power_unit = to_internal_power_unit(power_unit) or power_unit
+    return power_unit_mapping.get(internal_power_unit, power_unit)
+
+
 class UnknownEntity(HomeAssistantError):
     """Error to indicate there is an unknown entity_id given."""
 
@@ -651,6 +739,11 @@ class ConfigurationNotCompleteError(HomeAssistantError):
 class ValveRegulationNbEntitiesIncorrect(HomeAssistantError):
     """Error to indicate there is an error in the configuration of the TRV with valve regulation.
     The number of specific entities is incorrect."""
+
+
+class ValveRegulationCardinalityIncorrect(HomeAssistantError):
+    """Error to indicate that the min/max opening degrees lists cannot contain
+    more values than the number of underlying valves."""
 
 
 class SyncDeviceInternalTempNbEntitiesIncorrect(HomeAssistantError):

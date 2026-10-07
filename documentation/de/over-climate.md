@@ -62,6 +62,9 @@ Sie können aus den folgenden Optionen wählen, welche Lüftungsstufe aktiviert 
 
 Natürlich muss Ihr Gerät über eine Belüftung verfügen, und diese muss regelbar sein, damit dies funktioniert. Wenn Ihr Gerät nicht über den Turbo-Modus verfügt, wird stattdessen der Hoch-Modus verwendet. Sobald der Temperaturunterschied wieder klein wird, schaltet die Lüftung auf einen "normalen" Modus um, in Abhängigkeit von Ihrem Gerät (in dieser Reihenfolge): `Stumm`, `Quiet`, `Auto`, `Niedrig`. Es wird der erste verfügbare Modus für Ihr Gerät gewählt.
 
+> ![Tipp](images/tips.png) _*Externes Plugin*_
+> Eine erweiterte Version von Auto-Fan ist als externes Plugin verfügbar. Dieses Plugin bietet zusätzliche Konfigurationsmöglichkeiten und eine feinere Steuerung der automatischen Belüftung. Auf der Seite [Plugins](https://www.versatile-thermostat.org/fr/plugins/) können Sie dieses Plugin entdecken.
+
 ### Kompensation der Innentemperatur des zugehörigen Geräts
 
 Achtung! Diese Option darf nicht mit direkter Ventilsteuerung verwendet werden, wenn eine Kalibrierungseinheit vorhanden ist.
@@ -97,7 +100,7 @@ Die besonderen Funktionen, die für diesen Typ von VTherm konfiguriert werden m�
 1. Auto-Start/Stop: Automatischer Start und Stopp von VTherm auf der Grundlage von Nutzungsprognosen. Dies wird hier beschrieben: [Auto-Start/Stop-Funktion](feature-auto-start-stop.md).
 2. Wenn die Ventilregelung gewählt wird, ist die Konfiguration des TPI-Algorithmus über das Menü zugänglich. Siehe ([Algorithmen](algorithms.md)).
 
-## Verfolgung grundlegender Temperaturänderungen
+## Verfolgung verknüpfter Temperaturänderungen
 
 Einige Benutzer möchten ihre Geräte weiterhin wie bisher (ohne _VTherm_) benutzen. Sie möchten zum Beispiel die Fernbedienung Ihrer _WP_ benutzen oder den Drehknopf an Ihrem _TRV_ drehen.
 In diesem Fall wurde dem Gerät _VTherm_ eine Entität mit der Bezeichnung `follow underlying temp change` (Folge Temperatureinstellung am Gerät) hinzugefügt:

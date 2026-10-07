@@ -70,7 +70,10 @@ async def test_over_climate_regulation(hass: HomeAssistant, skip_hass_states_is_
         # Select a hvacmode, presence and preset
         await entity.async_set_hvac_mode(VThermHvacMode_HEAT)
         assert entity.vtherm_hvac_mode is VThermHvacMode_HEAT
-        assert entity.hvac_action == HVACAction.OFF
+        await wait_for_local_condition(
+            lambda: entity.hvac_action is HVACAction.IDLE, hass=hass
+        )
+        assert entity.hvac_action == HVACAction.IDLE
 
         assert entity.regulated_target_temp == entity.min_temp
 
@@ -167,7 +170,10 @@ async def test_over_climate_regulation_ac_mode(hass: HomeAssistant, skip_send_ev
     # Select a hvacmode, presence and preset
     await entity.async_set_hvac_mode(VThermHvacMode_COOL)
     assert entity.vtherm_hvac_mode is VThermHvacMode_COOL
-    assert entity.hvac_action == HVACAction.OFF
+    await wait_for_local_condition(
+        lambda: entity.hvac_action is HVACAction.IDLE, hass=hass
+    )
+    assert entity.hvac_action == HVACAction.IDLE
 
     # change temperature so that the heating will start
     entity._set_now(now)
@@ -215,6 +221,45 @@ async def test_over_climate_regulation_ac_mode(hass: HomeAssistant, skip_send_ev
     # the regulated temperature should be greater
     assert entity.regulated_target_temp > entity.target_temperature
     assert entity.regulated_target_temp == 25 + 3
+
+    entity.remove_thermostat()
+
+
+async def test_over_climate_ac_preset_temperatures_publish_cool_target(
+    hass: HomeAssistant,
+    skip_send_event,
+    fake_temp_sensor,
+    fake_ext_temp_sensor,
+    fake_underlying_climate,
+):
+    """Test that preset temperatures publish the COOL target used by the UI card."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="TheOverClimateMockName",
+        unique_id="uniqueId",
+        data=PARTIAL_CLIMATE_AC_CONFIG,
+    )
+
+    entity = await create_thermostat(
+        hass,
+        entry,
+        "climate.theoverclimatemockname",
+        temps={**default_temperatures_ac, "eco": 19.0, "eco_ac": 25.0},
+    )
+
+    await wait_for_local_condition(lambda: entity.is_ready is True)
+    await entity.async_set_hvac_mode(VThermHvacMode_HEAT)
+    await entity.async_set_preset_mode(VThermPreset.ECO)
+    assert entity.target_temperature == 19.0
+
+    await entity.async_set_hvac_mode(VThermHvacMode_COOL)
+    assert entity.vtherm_hvac_mode is VThermHvacMode_COOL
+    assert entity.target_temperature == 25.0
+    assert entity.find_preset_temp(VThermPreset.ECO) == 25.0
+
+    preset_temperatures = entity.extra_state_attributes["preset_temperatures"]
+    card_eco_temperature = preset_temperatures.get("eco_cool_temp", preset_temperatures["eco_temp"])
+    assert card_eco_temperature == 25.0, "The UI card resolves the ECO COOL temperature to " f"{card_eco_temperature} because eco_cool_temp is not published"
 
     entity.remove_thermostat()
 
@@ -510,7 +555,10 @@ async def test_over_climate_regulation_dtemp_null(
         # Select a hvacmode, presence and preset
         await entity.async_set_hvac_mode(VThermHvacMode_HEAT)
         assert entity.vtherm_hvac_mode is VThermHvacMode_HEAT
-        assert entity.hvac_action == HVACAction.OFF
+        await wait_for_local_condition(
+            lambda: entity.hvac_action is HVACAction.HEATING, hass=hass
+        )
+        assert entity.hvac_action == HVACAction.HEATING
 
         # change temperature so that the heating will start
         await send_temperature_change_event(entity, 15, event_timestamp)
@@ -656,3 +704,151 @@ async def test_over_climate_regulation_calculation_scheduled(hass: HomeAssistant
     assert vtherm.is_recalculate_scheduled is True
 
     vtherm.remove_thermostat()
+
+
+async def test_over_climate_set_regulation_mode_none_replaces_algo(
+    hass: HomeAssistant, skip_hass_states_is_state, skip_send_event, fake_underlying_climate
+):
+    """Test that switching the auto regulation mode to None at runtime replaces the
+    active regulation algo with the do-nothing one. Before the fix the previous algo
+    stayed in place and kept sending regulated setpoints to the underlyings, while
+    is_regulated was already reporting False"""
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="TheOverClimateMockName",
+        unique_id="uniqueId",
+        # This is include a medium regulation
+        data=PARTIAL_CLIMATE_CONFIG,
+    )
+
+    entity = await create_thermostat(hass, entry, "climate.theoverclimatemockname")
+    assert entity
+    assert isinstance(entity, ThermostatOverClimate)
+    assert entity.is_regulated is True
+
+    # The medium algo regulates: with a room temp below the target it adds an offset
+    entity._regulation_algo.set_target_temp(20)
+    assert entity._regulation_algo.calculate_regulated_temperature(17, 10, 1.0) != 20
+
+    await entity.service_set_auto_regulation_mode("None")
+    assert entity.is_regulated is False
+
+    # The do-nothing algo must now be in place: it always returns the target
+    entity._regulation_algo.set_target_temp(20)
+    assert entity._regulation_algo.calculate_regulated_temperature(17, 10, 1.0) == 20
+
+    entity.remove_thermostat()
+
+
+async def test_over_climate_no_regulation_outside_heat_cool(
+    hass: HomeAssistant, skip_hass_states_is_state, skip_send_event, fake_temp_sensor, fake_ext_temp_sensor
+):
+    """Test that auto-regulation is disabled when the over_climate is not in heat nor cool.
+
+    When the VTherm runs in a mode other than heat/cool (e.g. dry), the underlying must
+    receive the original (non regulated) target temperature."""
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="TheOverClimateMockName",
+        unique_id="uniqueId",
+        data={
+            CONF_NAME: "TheOverClimateMockName",
+            CONF_TEMP_SENSOR: "sensor.mock_temp_sensor",
+            CONF_THERMOSTAT_TYPE: CONF_THERMOSTAT_CLIMATE,
+            CONF_EXTERNAL_TEMP_SENSOR: "sensor.mock_ext_temp_sensor",
+            CONF_CYCLE_MIN: 5,
+            CONF_TEMP_MIN: 15,
+            CONF_TEMP_MAX: 30,
+            CONF_STEP_TEMPERATURE: 0.1,
+            CONF_USE_WINDOW_FEATURE: False,
+            CONF_USE_MOTION_FEATURE: False,
+            CONF_USE_POWER_FEATURE: False,
+            CONF_USE_PRESENCE_FEATURE: False,
+            CONF_UNDERLYING_LIST: ["climate.mock_climate"],
+            CONF_AC_MODE: True,
+            CONF_AUTO_REGULATION_MODE: CONF_AUTO_REGULATION_MEDIUM,
+            CONF_AUTO_REGULATION_DTEMP: 0.5,
+            CONF_AUTO_REGULATION_PERIOD_MIN: 2,
+            CONF_AUTO_FAN_MODE: CONF_AUTO_FAN_NONE,
+            CONF_AUTO_REGULATION_USE_DEVICE_TEMP: False,
+            CONF_MINIMAL_ACTIVATION_DELAY: 30,
+            CONF_MINIMAL_DEACTIVATION_DELAY: 0,
+            CONF_SAFETY_DELAY_MIN: 5,
+            CONF_SAFETY_MIN_ON_PERCENT: 0.3,
+        },
+    )
+
+    # The underlying must support DRY so the VTherm can be set to dry mode
+    await create_and_register_mock_climate(
+        hass,
+        "mock_climate",
+        "MockClimateName",
+        {},
+        hvac_modes=[VThermHvacMode_OFF, VThermHvacMode_COOL, VThermHvacMode_HEAT, VThermHvacMode_DRY],
+    )
+
+    tz = get_tz(hass)  # pylint: disable=invalid-name
+    now: datetime = datetime.now(tz=tz)
+
+    entity: ThermostatOverClimate = await create_thermostat(hass, entry, "climate.theoverclimatemockname")
+
+    assert entity
+    assert isinstance(entity, ThermostatOverClimate)
+    assert entity.is_over_climate is True
+    assert entity.is_regulated is True
+
+    await wait_for_local_condition(lambda: entity.is_ready is True)
+
+    # 1. Set the VTherm in COOL mode with a manual target of 25°C and a hot room so
+    # that the regulation is active and lowers the regulated temperature.
+    now = now + timedelta(minutes=5)
+    entity._set_now(now)
+    fake_temp_sensor.set_native_value(30)
+    fake_ext_temp_sensor.set_native_value(35)
+    await entity.async_set_hvac_mode(VThermHvacMode_COOL)
+    await entity.async_set_temperature(temperature=25)
+    await hass.async_block_till_done()
+
+    assert entity.vtherm_hvac_mode is VThermHvacMode_COOL
+    assert entity.target_temperature == 25
+
+    # Force a regulation calculation: the regulated temperature must differ from target
+    now = now + timedelta(minutes=3)
+    entity._set_now(now)
+    await entity._send_regulated_temperature(force=True)
+    assert entity.regulated_target_temp != entity.target_temperature
+
+    under = entity._underlyings[0]
+    # In cool mode the last sent temperature is the regulated value (different from target)
+    assert under.last_sent_temperature != entity.target_temperature
+
+    # Patch the service call so the real set_temperature runs and updates
+    # last_sent_temperature, allowing the de-duplication logic to be exercised.
+    with patch("custom_components.versatile_thermostat.underlyings.UnderlyingClimate.hass_services_async_call") as mock_service_call:
+        # 2. Switch to DRY mode: auto-regulation must be disabled and the raw target
+        # temperature must be sent to the underlying.
+        now = now + timedelta(minutes=3)
+        entity._set_now(now)
+        await entity.async_set_hvac_mode(VThermHvacMode_DRY)
+        await hass.async_block_till_done()
+
+        assert entity.vtherm_hvac_mode is VThermHvacMode_DRY
+
+        # The regulated target temperature must be forced to the raw target temperature
+        assert entity.regulated_target_temp == entity.target_temperature
+
+        # The underlying must have received the raw target temperature (no regulation offset)
+        assert under.last_sent_temperature == entity.target_temperature
+
+        # 3. A new regulation cycle with an unchanged target must NOT resend the
+        # setpoint to avoid resending the same command on each cycle.
+        calls_after_switch = mock_service_call.call_count
+        now = now + timedelta(minutes=3)
+        entity._set_now(now)
+        await entity._send_regulated_temperature(force=True)
+        await hass.async_block_till_done()
+        assert mock_service_call.call_count == calls_after_switch
+
+    entity.remove_thermostat()

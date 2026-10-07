@@ -596,6 +596,7 @@ class UnderlyingClimate(UnderlyingEntity):
 
     async def set_hvac_mode(self, hvac_mode: VThermHvacMode) -> bool:
         """Set the HVACmode of the underlying climate. Returns true if something have change"""
+        hvac_mode = self._thermostat.get_underlying_hvac_mode(hvac_mode)
         state = self._state_manager.get_state(self._entity_id)
         if state is None:
             return False
@@ -612,6 +613,13 @@ class UnderlyingClimate(UnderlyingEntity):
         if hvac_mode in (VThermHvacMode_HEAT, VThermHvacMode_COOL) and not await self.check_overpowering():
             return False
 
+        # Always cancel a pending delayed temperature resend, whatever the new mode is.
+        # Otherwise a HEAT -> OFF sequence within resend_delay_sec would send a set_temperature
+        # to an underlying that is now off, which turns some devices (e.g. Sonoff TRVZB) back on.
+        if self._cancel_set_temperature_later:
+            self._cancel_set_temperature_later()
+            self._cancel_set_temperature_later = None
+
         await super().set_hvac_mode(hvac_mode)
 
         data = {ATTR_ENTITY_ID: self._entity_id, "hvac_mode": to_legacy_ha_hvac_mode(hvac_mode)}
@@ -625,10 +633,14 @@ class UnderlyingClimate(UnderlyingEntity):
         if hvac_mode in (VThermHvacMode_HEAT, VThermHvacMode_COOL):
 
             async def callback_resend_temp(_):
-                await self.set_temperature(self._thermostat.target_temperature, None, None)
+                temperature = self.last_sent_temperature
+                if temperature is None:
+                    temperature = getattr(self._thermostat, "regulated_target_temperature", None)
+                if temperature is None:
+                    temperature = self._thermostat.target_temperature
+                if temperature is not None:
+                    await self.set_temperature(temperature, None, None)
 
-            if self._cancel_set_temperature_later:
-                self._cancel_set_temperature_later()
             self._cancel_set_temperature_later = async_call_later(self._hass, resend_delay_sec, callback_resend_temp)
 
         # Dual-setpoint fork: resend the high/low range when (re)entering HEAT_COOL
@@ -877,8 +889,15 @@ class UnderlyingClimate(UnderlyingEntity):
 
         _LOGGER.info("%s - Set setpoint temperature to: %s", self, target_temp)
 
-        # Issue 807 add TARGET_TEMPERATURE only if in the features
-        if ClimateEntityFeature.TARGET_TEMPERATURE_RANGE in self.supported_features:
+        # Issue 807 add TARGET_TEMPERATURE only if in the features.
+        # Use a bitwise test (not the `in` operator): self.supported_features is read
+        # from the underlying entity's state attributes, where Home Assistant may store
+        # it as a plain int (e.g. for restored states). `EnumMember in <int>` raises
+        # `TypeError: argument of type 'int' is not a container or iterable`, whereas
+        # the bitwise `&` works for both a plain int and a ClimateEntityFeature IntFlag.
+        # This matches the bitwise pattern already used elsewhere in this class
+        # (fan_modes / swing_modes).
+        if self.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE:
             data.update(
                 {
                     "target_temp_high": target_temp,
@@ -886,7 +905,7 @@ class UnderlyingClimate(UnderlyingEntity):
                 }
             )
 
-        if ClimateEntityFeature.TARGET_TEMPERATURE in self.supported_features:
+        if self.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE:
             data["temperature"] = target_temp
 
         try:
@@ -1188,6 +1207,13 @@ class UnderlyingClimate(UnderlyingEntity):
         if str(hvac_mode) == str(under_hvac_mode):
             return False
 
+        if self._thermostat.now < self._last_command_sent_datetime + timedelta(seconds=resend_delay_sec):
+            _LOGGER.debug(
+                "%s - Skipping climate state repair while waiting for the last command to be applied",
+                self,
+            )
+            return False
+
         await self.set_hvac_mode(hvac_mode)
         return True
 
@@ -1218,6 +1244,11 @@ class UnderlyingValve(UnderlyingEntity):
         thermostat: Any,
         valve_entity_id: str,
         entity_type: UnderlyingEntityType = UnderlyingEntityType.VALVE,
+        min_opening_degree: int | None = None,
+        max_opening_degree: int | None = None,
+        max_closing_degree: int = 100,
+        opening_threshold: int = 0,
+        has_valve_control: bool = False,
     ) -> None:
         """Initialize the underlying valve"""
 
@@ -1229,10 +1260,16 @@ class UnderlyingValve(UnderlyingEntity):
         )
         self._hvac_mode = None
         self._percent_open: int | None = None  # self._thermostat.valve_open_percent
+        self._raw_percent_open: float | None = None
         self._min_open: float | None = None
         self._max_open: float | None = None
         self._last_sent_temperature = None
         self._last_sent_opening_value: int | None = None
+        self._min_opening_degree = min_opening_degree
+        self._max_opening_degree = max_opening_degree
+        self._max_closing_degree = max_closing_degree
+        self._opening_threshold = opening_threshold
+        self._has_valve_control = has_valve_control
 
     def init_valve_state_min_max_open(self):
         """Initialize the min and max open percent"""
@@ -1261,6 +1298,11 @@ class UnderlyingValve(UnderlyingEntity):
 
         self.init_valve_state_min_max_open()
 
+        raw_percent = self._thermostat.valve_open_percent
+        if self._has_valve_control and isinstance(raw_percent, (int, float)):
+            self._raw_percent_open = raw_percent
+            self._percent_open = self._get_controlled_percent(raw_percent)
+
         should_device_be_active = self.should_device_be_active
         is_device_active = self.is_device_active
 
@@ -1281,7 +1323,9 @@ class UnderlyingValve(UnderlyingEntity):
                 self._last_sent_opening_value or 9999,
                 self._entity_id,
             )
-            await self.send_percent_open(fixed_value=self._min_open)
+            self._percent_open = self._get_controlled_percent(0)
+            self._raw_percent_open = 0
+            await self.send_percent_open()
 
     async def send_percent_open(self, fixed_value: int = None):
         """Send the percent open to the underlying valve"""
@@ -1295,7 +1339,8 @@ class UnderlyingValve(UnderlyingEntity):
         _LOGGER.debug("%s - Stopping underlying valve entity %s", self, self._entity_id)
         # Issue 341
         is_active = self.is_device_active
-        self._percent_open = self.clamp_sent_value(0)
+        self._percent_open = self._get_controlled_percent(0)
+        self._raw_percent_open = 0
         if is_active:
             await self.send_percent_open()
 
@@ -1321,10 +1366,14 @@ class UnderlyingValve(UnderlyingEntity):
     @property
     def should_device_be_active(self) -> bool:
         """If the toggleable device is currently active."""
-        try:
+        if not self._has_valve_control:
             return self._percent_open > (self._min_open or 0) if isinstance(self._percent_open, (int, float)) else False
-        except Exception:  # pylint: disable=broad-exception-caught
-            return False
+
+        return (
+            self._raw_percent_open > 0 and self._raw_percent_open >= self._opening_threshold
+            if isinstance(self._raw_percent_open, (int, float))
+            else False
+        )
 
     @property
     def is_device_active(self) -> bool | None:
@@ -1332,7 +1381,7 @@ class UnderlyingValve(UnderlyingEntity):
         if (current_opening := self.current_valve_opening) is None:
             return None
 
-        return current_opening > (self._min_open or 0)
+        return current_opening > max(100 - self._max_closing_degree, self._min_open or 0)
 
     @overrides
     def clamp_sent_value(self, value) -> float:
@@ -1359,7 +1408,9 @@ class UnderlyingValve(UnderlyingEntity):
 
     async def set_valve_open_percent(self):
         """Update the valve open percent"""
-        caped_val = self.clamp_sent_value(self._thermostat.valve_open_percent)
+        raw_percent = self._thermostat.valve_open_percent
+        self._raw_percent_open = raw_percent
+        caped_val = self._get_controlled_percent(raw_percent)
         if self._percent_open == caped_val:
             # No changes
             return
@@ -1374,6 +1425,23 @@ class UnderlyingValve(UnderlyingEntity):
         # self._hass.create_task(self.send_percent_open())
         await self.send_percent_open()
 
+    def _get_controlled_percent(self, raw_percent: int) -> int:
+        """Convert the raw TPI command to the effective valve command."""
+        if self._min_opening_degree is None or self._max_opening_degree is None:
+            return self.clamp_sent_value(raw_percent)
+
+        opening_degree, _ = OpeningClosingDegreeCalculation.calculate_opening_closing_degree(
+            brut_valve_open_percent=raw_percent,
+            min_opening_degree=self._min_opening_degree,
+            max_closing_degree=self._max_closing_degree,
+            max_opening_degree=self._max_opening_degree,
+            opening_threshold=self._opening_threshold,
+        )
+        if not self.is_initialized:
+            raise RuntimeError(f"{self} - cannot clamp sent value because underlying is not initialized")
+
+        return round(max(self._min_open, min(opening_degree, self._max_open)))
+
     def remove_entity(self):
         """Remove the entity"""
         super().remove_entity()
@@ -1387,6 +1455,11 @@ class UnderlyingValve(UnderlyingEntity):
     def last_sent_opening_value(self) -> int | None:
         """Return the last sent value to the valve"""
         return self._last_sent_opening_value
+
+    @property
+    def command_percent(self) -> int | None:
+        """Return the effective command sent to the valve."""
+        return self._percent_open
 
     @overrides
     async def check_and_repair(self) -> bool:
@@ -1464,6 +1537,11 @@ class UnderlyingValveRegulation(UnderlyingValve):
         # Initialize valve state and min max opening
         self.init_valve_state_min_max_open()
 
+        if self._thermostat.is_sleeping:
+            self._percent_open = 100
+            await self.send_percent_open()
+            return
+
         hvac_mode = self._thermostat.vtherm_hvac_mode
         device_valve_opening = self.current_valve_opening  # the real opening value
 
@@ -1528,6 +1606,17 @@ class UnderlyingValveRegulation(UnderlyingValve):
         if self._has_max_closing_degree:
             entities.append(self._closing_degree_entity_id)
         self._state_manager.add_underlying_entities(entities)
+
+    @overrides
+    def _get_controlled_percent(self, raw_percent: int) -> int:
+        """Keep the raw TPI percentage until ``send_percent_open``.
+
+        ``send_percent_open`` below already applies the opening/closing-degree
+        calculation. The base implementation performs the same calculation for
+        direct ``over_valve`` control, which would otherwise transform the
+        value twice for valve-regulation underlyings.
+        """
+        return raw_percent
 
     async def send_percent_open(self, fixed_value: int = None):
         """Send the percent open to the underlying valve"""

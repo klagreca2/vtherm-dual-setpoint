@@ -7,6 +7,7 @@ from typing import Optional, Any, Generic
 from datetime import datetime
 from collections.abc import Callable
 
+from vtherm_api import ValveDiagnosticState
 from vtherm_api.log_collector import get_vtherm_logger
 from homeassistant.util import dt as dt_util
 
@@ -56,7 +57,7 @@ from .commons_type import ConfigData
 from .config_schema import *  # pylint: disable=wildcard-import, unused-wildcard-import
 
 from .vtherm_central_api import VersatileThermostatAPI
-from .underlyings import UnderlyingEntity, T
+from .underlyings import UnderlyingEntity, UnderlyingValve, T
 
 from .ema import ExponentialMovingAverage
 
@@ -71,6 +72,7 @@ from .feature_lock_manager import FeatureLockManager
 from .feature_timed_preset_manager import FeatureTimedPresetManager
 from .feature_heating_failure_detection_manager import FeatureHeatingFailureDetectionManager
 from .feature_repair_incorrect_state_manager import FeatureRepairIncorrectStateManager
+from .feature_humidity_manager import FeatureHumidityManager
 from .state_manager import StateManager
 from .vtherm_state import VThermState
 from .vtherm_preset import VThermPreset, HIDDEN_PRESETS, PRESET_AC_SUFFIX
@@ -87,11 +89,17 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
     _attr_swing_horizontal_mode = ""
 
     _entity_component_unrecorded_attributes = (
-        ClimateEntity._entity_component_unrecorded_attributes.union(frozenset({"configuration", "preset_temperatures"}))
+        ClimateEntity._entity_component_unrecorded_attributes.union(frozenset({"configuration", "preset_temperatures", "specific_states"}))
         .union(FeaturePresenceManager.unrecorded_attributes)
         .union(FeaturePowerManager.unrecorded_attributes)
         .union(FeatureMotionManager.unrecorded_attributes)
         .union(FeatureWindowManager.unrecorded_attributes)
+        .union(FeatureSafetyManager.unrecorded_attributes)
+        .union(FeatureLockManager.unrecorded_attributes)
+        .union(FeatureTimedPresetManager.unrecorded_attributes)
+        .union(FeatureHeatingFailureDetectionManager.unrecorded_attributes)
+        .union(FeatureRepairIncorrectStateManager.unrecorded_attributes)
+        .union(FeatureHumidityManager.unrecorded_attributes)
     )
 
     ##
@@ -136,7 +144,6 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         self._ac_mode = None
 
         self._cur_temp = None
-
         self._temp_sensor_entity_id = None
         self._last_seen_temp_sensor_entity_id = None
         self._ext_temp_sensor_entity_id = None
@@ -149,6 +156,7 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         self._attr_translation_key = "versatile_thermostat"
 
         self._total_energy = None
+        self._energy_unit_needs_persistence = False
         _LOGGER.debug("%s - _init_ resetting energy to None", self)
 
         # Because energy of climate is calculated in the thermostat we have to keep
@@ -194,12 +202,24 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         self._use_central_config_temperature = False
 
         self._hvac_off_reason: str | None = None
+        self._hvac_mode_reason: str | None = None
         self._hvac_list: list[VThermHvacMode] = []
         self._str_hvac_list: list[str] = []
         self._temperature_reason: str | None = None
 
         # Instantiate all features manager
         self._managers: list[BaseFeatureManager] = []
+
+        # Names of feature managers provided by external plugins that have
+        # already been instantiated for this thermostat. Used to avoid
+        # registering the same external manager twice (post_init + startup retry).
+        self._external_manager_names: set[str] = set()
+
+        # Instances of feature managers provided by external plugins. They are
+        # also present in ``self._managers`` (for lifecycle) but are tracked
+        # separately so they can be refreshed on every control cycle (internal
+        # managers have their own dedicated per-cycle mechanisms).
+        self._external_managers: list[BaseFeatureManager] = []
 
         self._presence_manager: FeaturePresenceManager = FeaturePresenceManager(
             self, hass
@@ -214,6 +234,7 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         self._timed_preset_manager: FeatureTimedPresetManager = FeatureTimedPresetManager(self, hass)
         self._heating_failure_detection_manager: FeatureHeatingFailureDetectionManager = FeatureHeatingFailureDetectionManager(self, hass)
         self._repair_incorrect_state_manager: FeatureRepairIncorrectStateManager = FeatureRepairIncorrectStateManager(self, hass)
+        self._humidity_manager: FeatureHumidityManager = FeatureHumidityManager(self, hass)
 
         self.register_manager(self._presence_manager)
         self.register_manager(self._power_manager)
@@ -224,6 +245,7 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         self.register_manager(self._timed_preset_manager)
         self.register_manager(self._heating_failure_detection_manager)
         self.register_manager(self._repair_incorrect_state_manager)
+        self.register_manager(self._humidity_manager)
 
         self._cancel_recalculate_later: Callable[[], None] | None = None
 
@@ -233,17 +255,61 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         """Register a manager"""
         self._managers.append(manager)
 
+    def get_feature_manager(self, name: str):
+        """Return the newest manager registered under a stable name."""
+        for manager in reversed(self._managers):
+            if getattr(manager, "name", None) == name:
+                return manager
+        return None
+
+    def _load_external_feature_managers(self):
+        """Instantiate feature managers provided by external plugins.
+
+        Query the VTherm API registry and create one manager instance per
+        eligible thermostat (the factory decides eligibility through its
+        ``supports`` method). Managers whose plugin registers after this
+        thermostat has been built are picked up later during ``async_startup``,
+        mirroring the external proportional algorithm retry behavior.
+        """
+        api = VersatileThermostatAPI.get_vtherm_api(self.hass)
+        if api is None or not hasattr(api, "get_feature_manager_factories"):
+            return
+
+        for factory in api.get_feature_manager_factories():
+            name = factory.name
+            if name in self._external_manager_names:
+                continue
+            try:
+                if not factory.supports(self):
+                    continue
+                manager = factory.create(self)
+                manager.post_init(self._entry_infos)
+            except Exception as exc:  # pylint: disable=broad-except
+                _LOGGER.error(
+                    "%s - Error while creating external feature manager '%s': %s",
+                    self,
+                    name,
+                    exc,
+                )
+                continue
+
+            self.register_manager(manager)
+            self._external_manager_names.add(name)
+            self._external_managers.append(manager)
+            _LOGGER.info("%s - Registered external feature manager '%s'", self, name)
+
     def clean_central_config_doublon(
         self, config_entry: ConfigData, central_config: ConfigEntry | None
     ) -> dict[str, Any]:
         """Removes all values from config with are concerned by central_config"""
 
-        def clean_one(cfg, schema: vol.Schema):
+        def clean_one(cfg, schema: vol.Schema, excluded_keys: set[str] | None = None):
             """Clean one schema"""
+            excluded_keys = excluded_keys or set()
             for marker in schema.schema:
                 # Extract the actual key from Voluptuous Marker objects
                 key = marker.schema if hasattr(marker, 'schema') else marker
-                if key in cfg:
+                if key in cfg and key not in excluded_keys:
                     del cfg[key]
 
         cfg = config_entry.copy()
@@ -262,7 +328,14 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
                 clean_one(cfg, STEP_CENTRAL_MOTION_DATA_SCHEMA)
 
             if cfg.get(CONF_USE_POWER_CENTRAL_CONFIG) is True:
-                clean_one(cfg, STEP_CENTRAL_POWER_DATA_SCHEMA)
+                # The central unit may be ``auto``. It only controls how the
+                # central input sensors are read; each VTherm keeps its own
+                # display unit (W or kW) for its power and energy sensors.
+                clean_one(
+                    cfg,
+                    STEP_CENTRAL_POWER_DATA_SCHEMA,
+                    {CONF_POWER_UNIT},
+                )
 
             if cfg.get(CONF_USE_PRESENCE_CENTRAL_CONFIG) is True:
                 clean_one(cfg, STEP_CENTRAL_PRESENCE_DATA_SCHEMA)
@@ -303,6 +376,11 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         # Post init all managers
         for manager in self._managers:
             manager.post_init(entry_infos)
+
+        # Instantiate feature managers provided by external plugins that are
+        # already registered at this point. Late-registered plugins are handled
+        # by a retry in async_startup.
+        self._load_external_feature_managers()
 
         self._use_central_config_temperature = entry_infos.get(
             CONF_USE_PRESETS_CENTRAL_CONFIG
@@ -355,6 +433,7 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         self._last_ext_temperature_measure = self.now
 
         self._total_energy = None
+        self._energy_unit_needs_persistence = False
         _LOGGER.debug("%s - post_init_ resetting energy to None", self)
 
         # Read the parameter from configuration.yaml if it exists
@@ -483,6 +562,12 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         _LOGGER.debug("%s - Calling async_startup_internal", self)
         # need_write_state = False
 
+        # Retry loading external feature managers: a plugin may have registered
+        # its factory after this thermostat was built (load order between the
+        # core and the plugin is not guaranteed). Newly created managers are
+        # then started in the loop below.
+        self._load_external_feature_managers()
+
         # start listening for all managers
         for manager in self._managers:
             await manager.start_listening()
@@ -542,6 +627,11 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         if self.is_ready:
             await self.init_underlyings_completed()
 
+    @property
+    def current_humidity(self) -> float | None:
+        """Return humidity supplied by the external humidity manager."""
+        return self._humidity_manager.current_humidity
+
     async def init_underlyings_completed(self, under_entity_id: Optional[str] = None):
         """All underlyings have been initialized. Then we can finish our initialization"""
         _LOGGER.debug("%s - Calling init_underlyings_completed", self)
@@ -571,6 +661,7 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
             #    need_write_state = True
 
         await self.update_states(force=True)
+        self._persist_energy_unit_if_needed()
         self.recalculate()
 
         # check initial state should be done after the current state has been calculated and so after the manager has been updated
@@ -584,8 +675,24 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         restored
         """
 
+    def _persist_energy_unit_if_needed(self) -> None:
+        """Persist restored energy in the current power unit when it changed."""
+        if not self._energy_unit_needs_persistence:
+            return
+
+        _LOGGER.info(
+            "%s - Rewriting restored energy from its previous unit to %s",
+            self,
+            self.power_manager.power_unit,
+        )
+        self.update_custom_attributes()
+        self.async_write_ha_state()
+        self._energy_unit_needs_persistence = False
+
     async def get_my_previous_state(self):
         """Try to get my previous state"""
+        self._energy_unit_needs_persistence = False
+
         # Check If we have an old state
         old_state = await self.async_get_last_state()
         _LOGGER.debug(
@@ -640,11 +747,43 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
 
             # Try to get total_energy from specific_states (new format) or root level (old format)
             specific_states = old_state.attributes.get("specific_states", {})
+            self._hvac_mode_reason = specific_states.get(HVAC_MODE_REASON_NAME, self._hvac_off_reason)
             old_total_energy = specific_states.get(ATTR_TOTAL_ENERGY)
             if old_total_energy is None:
                 # Fallback to root level for backward compatibility
                 old_total_energy = old_state.attributes.get(ATTR_TOTAL_ENERGY)
-            self._total_energy = old_total_energy if old_total_energy is not None else 0
+            # Energy is stored in the unit associated with the configured power unit.
+            # Legacy states did not record that unit, so use their persisted
+            # configuration before falling back to the migrated current one.
+            if old_total_energy is not None:
+                stored_unit = specific_states.get(ATTR_TOTAL_ENERGY_UNIT)
+                if stored_unit is None:
+                    stored_unit = old_state.attributes.get("configuration", {}).get(
+                        CONF_POWER_UNIT,
+                        self.power_manager.power_unit,
+                    )
+                current_unit = to_internal_power_unit(self.power_manager.power_unit) or POWER_UNIT_WATT
+                stored_unit = to_internal_power_unit(stored_unit)
+                has_invalid_stored_unit = stored_unit not in (POWER_UNIT_WATT, POWER_UNIT_KILO_WATT)
+                if has_invalid_stored_unit:
+                    _LOGGER.warning(
+                        "%s - Restored energy has an unsupported unit %s. Using %s",
+                        self,
+                        stored_unit,
+                        self.power_manager.power_unit,
+                    )
+                    stored_unit = current_unit
+                self._energy_unit_needs_persistence = has_invalid_stored_unit or stored_unit != current_unit
+                if self._energy_unit_needs_persistence:
+                    _LOGGER.info(
+                        "%s - Restored energy unit %s differs from configured unit %s",
+                        self,
+                        to_legal_power_unit(stored_unit),
+                        self.power_manager.power_unit,
+                    )
+                self._total_energy = power_to_watts(old_total_energy, stored_unit) if old_total_energy else 0
+            else:
+                self._total_energy = 0
             _LOGGER.debug(
                 "%s - get_my_previous_state restored energy is %s",
                 self,
@@ -882,6 +1021,24 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         return self._state_manager.current_state.hvac_mode
 
     @property
+    def requested_hvac_mode(self) -> VThermHvacMode | None:
+        """Return the mode requested by the user before feature overrides."""
+        return self._state_manager.requested_state.hvac_mode
+
+    @property
+    def valve_diagnostics(self) -> tuple[ValveDiagnosticState, ...]:
+        """Expose valve commanded and observed states without leaking underlyings."""
+        return tuple(
+            ValveDiagnosticState(
+                entity_id=underlying.entity_id,
+                should_be_active=underlying.should_device_be_active,
+                is_active=underlying.is_device_active,
+            )
+            for underlying in self._underlyings
+            if isinstance(underlying, UnderlyingValve)
+        )
+
+    @property
     def is_recalculate_scheduled(self) -> bool:
         """Return true if a recalculation is scheduled."""
         return self._cancel_recalculate_later is not None
@@ -896,6 +1053,30 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
     def target_temperature(self) -> float | None:
         """Return the temperature we try to reach."""
         return self._state_manager.current_state.target_temperature
+
+    @property
+    def regulated_target_temperature(self) -> float | None:
+        """Return the regulated target temperature used to drive the underlying.
+
+        The base implementation returns the plain target temperature. Over
+        climate thermostats override this to expose their regulated value.
+        """
+        return self.target_temperature
+
+    @property
+    def underlying_fan_modes(self) -> list[str] | None:
+        """Return the fan modes exposed by the underlying climate(s).
+
+        The base implementation returns None because most thermostats do not
+        expose an underlying climate with fan control.
+        """
+        return None
+
+    async def async_set_underlying_fan_mode(self, fan_mode: str) -> None:
+        """Send a fan mode to the underlying climate(s).
+
+        The base implementation is a no-op for thermostats without fan control.
+        """
 
     @property
     def supported_features(self) -> ClimateEntityFeature:
@@ -1287,6 +1468,14 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         return self._hvac_off_reason
 
     @property
+    def hvac_mode_reason(self) -> str | None:
+        """Returns the reason why the current hvac_mode is forced.
+        Unlike hvac_off_reason, this is set whatever the forced hvac_mode is
+        (off, fan_only, dry, ...) so the UI can explain why the VTherm is not
+        in the requested mode."""
+        return self._hvac_mode_reason
+
+    @property
     def temperature_reason(self) -> str | None:
         """Returns the reason of the target temperature
         This is useful for features that changes the VTherm like window detection or power management"""
@@ -1389,6 +1578,10 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         # Change the requested state
         self._state_manager.requested_state.set_hvac_mode(hvac_mode)
         await self.update_states(force=False)
+
+    def get_underlying_hvac_mode(self, hvac_mode: VThermHvacMode) -> VThermHvacMode:
+        """Return the physical HVAC mode to apply to underlyings."""
+        return hvac_mode
 
     @overrides
     @check_lock
@@ -1616,8 +1809,29 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         # Call specific control heating
         await self._control_heating_specific(timestamp, force)
 
-        # Check for heating/cooling failures (only for TPI VTherms)
-        await self._heating_failure_detection_manager.refresh_state()
+        # Refresh external feature managers (provided by plugins) on every cycle.
+        # This is done after the specific control heating so that a manager can
+        # react to the regulated target temperature (e.g. drive the underlying
+        # fan mode), and before the publication block below so that any custom
+        # attributes updated here are written to HA within the same cycle.
+        # Only external managers are refreshed here: internal managers have their
+        # own dedicated per-cycle mechanisms. A per-manager guard prevents a
+        # faulty plugin from breaking the control loop.
+        for manager in self._external_managers:
+            try:
+                await manager.refresh_state()
+            except Exception as exc:  # pylint: disable=broad-except
+                _LOGGER.error(
+                    "%s - Error while refreshing external feature manager '%s': %s",
+                    self,
+                    manager.name,
+                    exc,
+                )
+
+        # Preserve the legacy manager until existing entries have migrated, but
+        # let an external manager with the same stable name take precedence.
+        if "heating_failure_detection" not in self._external_manager_names:
+            await self._heating_failure_detection_manager.refresh_state()
 
         # Check and repair state discrepancies
         await self._repair_incorrect_state_manager.check_and_repair()
@@ -1702,6 +1916,9 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
                 # issue #1958 - when window_action=fan_only temporarily switches the mode to FAN_ONLY,
                 # the user's intent (requested_state) is still COOL, so we must use AC presets.
                 or (self.vtherm_hvac_mode == VThermHvacMode_FAN_ONLY and self.requested_state.hvac_mode == VThermHvacMode_COOL)
+                # when auto-start/stop temporarily switches the mode to DRY as its stop mode,
+                # the user's intent (requested_state) is still COOL, so we must use AC presets.
+                or (self.vtherm_hvac_mode == VThermHvacMode_DRY and self.requested_state.hvac_mode == VThermHvacMode_COOL)
                 #                (self.is_over_switch and self._ac_mode)
                 #                or self.vtherm_hvac_mode == VThermHvacMode_COOL
                 #                or (self.vtherm_hvac_mode == VThermHvacMode_OFF and self.requested_state.hvac_mode == VThermHvacMode_COOL)
@@ -1754,6 +1971,10 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
     def set_hvac_off_reason(self, hvac_off_reason: str | None):
         """Set the reason of hvac_off"""
         self._hvac_off_reason = hvac_off_reason
+
+    def set_hvac_mode_reason(self, hvac_mode_reason: str | None):
+        """Set the reason why the current hvac_mode is forced"""
+        self._hvac_mode_reason = hvac_mode_reason
 
     def set_temperature_reason(self, temperature_reason: str | None):
         """Set the reason of temperature"""
@@ -1836,6 +2057,7 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
                 "last_central_mode": self.last_central_mode,
                 "last_update_datetime": self.now.isoformat(),
                 "ext_current_temperature": self._cur_ext_temp,
+                "humidity_sensor_entity_id": self._humidity_manager.humidity_sensor_entity_id,
                 "last_temperature_datetime": self._last_temperature_measure.astimezone(self._current_tz).isoformat(),
                 "last_ext_temperature_datetime": self._last_ext_temperature_measure.astimezone(self._current_tz).isoformat(),
                 "should_device_be_active": self.should_device_be_active,
@@ -1845,7 +2067,12 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
                 "ema_temp": self._ema_temp,
                 "temperature_slope": round(self.last_temperature_slope or 0, 3),
                 "hvac_off_reason": self.hvac_off_reason,
-                ATTR_TOTAL_ENERGY: self.total_energy,
+                "hvac_mode_reason": self.hvac_mode_reason,
+                ATTR_TOTAL_ENERGY: self.power_manager.from_watts(
+                    self.total_energy,
+                    self.power_manager.power_unit,
+                ),
+                ATTR_TOTAL_ENERGY_UNIT: self.power_manager.power_unit,
                 "last_change_time_from_vtherm": (
                     self._last_change_time_from_vtherm.astimezone(self._current_tz).isoformat() if self._last_change_time_from_vtherm is not None else None
                 ),
@@ -1867,6 +2094,7 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
                 "max_on_percent": self._max_on_percent,
                 "have_valve_regulation": self.have_valve_regulation,
                 "cycle_min": self._cycle_min,
+                CONF_POWER_UNIT: self.power_manager.power_unit,
             },
             "preset_temperatures": {
                 "frost_temp": self._presets.get(VThermPreset.FROST, 0),
@@ -1880,10 +2108,33 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
             },
         }
 
+        if self.is_over_climate and self._ac_mode:
+            self._attr_extra_state_attributes["preset_temperatures"].update(
+                {
+                    "eco_cool_temp": self._presets.get(VThermPreset.ECO + PRESET_AC_SUFFIX, 0),
+                    "boost_cool_temp": self._presets.get(VThermPreset.BOOST + PRESET_AC_SUFFIX, 0),
+                    "comfort_cool_temp": self._presets.get(VThermPreset.COMFORT + PRESET_AC_SUFFIX, 0),
+                    "eco_cool_away_temp": self._presets_away.get(
+                        self.get_preset_away_name(VThermPreset.ECO + PRESET_AC_SUFFIX), 0
+                    ),
+                    "boost_cool_away_temp": self._presets_away.get(
+                        self.get_preset_away_name(VThermPreset.BOOST + PRESET_AC_SUFFIX), 0
+                    ),
+                    "comfort_cool_away_temp": self._presets_away.get(
+                        self.get_preset_away_name(VThermPreset.COMFORT + PRESET_AC_SUFFIX), 0
+                    ),
+                }
+            )
+
         self._state_manager.add_custom_attributes(self._attr_extra_state_attributes)
 
         for manager in self._managers:
-            manager.add_custom_attributes(self._attr_extra_state_attributes)
+            # add_custom_attributes is optional for external feature managers
+            # (it is not part of the InterfaceFeatureManager contract), so call
+            # it defensively.
+            publish_attributes = getattr(manager, "add_custom_attributes", None)
+            if callable(publish_attributes):
+                publish_attributes(self._attr_extra_state_attributes)
 
     def send_event(self, event_type: EventType, data: dict):
         """Send an event"""
@@ -2156,7 +2407,13 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
             "This thermostat does not use TPI algorithm."
         )
 
-    async def service_set_auto_tpi_mode(self, auto_tpi_mode: bool):
+    async def service_set_auto_tpi_mode(
+        self,
+        auto_tpi_mode: bool,
+        reinitialise: bool = True,
+        allow_kint_boost_on_stagnation: bool = False,
+        allow_kext_compensation_on_overshoot: bool = False,
+    ):
         """Stub method for Auto TPI mode service on non-TPI thermostats.
 
         This service is only available for switch/valve type thermostats that use TPI algorithm.

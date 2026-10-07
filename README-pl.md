@@ -30,27 +30,50 @@ Karta integracji VTherm UI (dostępna na [Github](https://github.com/jmcollin78/
 # Co nowego?
 ![New](images/new-icon.png)
 
+## Wydanie 10.5.0
+
+Wykrywanie anomalii ogrzewania może być teraz używane jako zewnętrzna wtyczka
+`vtherm_heating_failure_detection`. Wtyczka oferuje konfigurację centralną oraz
+nadpisania dla poszczególnych VThermów; jej formularze wstępnie uzupełniają
+istniejące ustawienia core, aby ułatwić migrację.
+
+W okresie przejściowym ustawienia wtyczki mają pierwszeństwo, a wartości
+niezdefiniowane we wtyczce nadal korzystają ze starszej konfiguracji core.
+Wyłącz starszą funkcję dla danego VThermu przed włączeniem wtyczki, aby uniknąć
+podwójnej konfiguracji.
+
+Binarny czujnik anomalii ogrzewania jest teraz udostępniany przez wtyczkę. Jeśli
+można to zrobić bez konfliktu, jego istniejący `entity_id` zostanie zachowany,
+aby dashboardy i automatyzacje nadal działały. Po wyłączeniu starszego czujnika
+przeładuj wpis wtyczki; jeśli pozostanie aktywny, Home Assistant może utworzyć
+nowy `entity_id`, którego należy użyć w istniejących elementach korzystających
+z czujnika.
+
+## Wydanie 10.4.0
+VTherm może teraz udostępniać `current_humidity` z zewnętrznego czujnika wilgotności dla wszystkich typów termostatów. Czujnik można wybrać w menu Wilgotność lub wykryć automatycznie na urządzeniu czujnika temperatury pokojowej.
+
+Termostaty `over_valve` mają teraz takie same parametry sterowania zaworem jak termostaty `over_climate` z regulacją przez bezpośrednie sterowanie zaworem: `opening_threshold_degree`, `min_opening_degrees`, `max_closing_degree` oraz `max_opening_degrees`. Więcej informacji: [sterowanie zaworem](documentation/pl/over-valve.md).
+
+Termostaty `over_valve` obsługują teraz również tryb uśpienia. Tryb ten wyświetla VTherm jako wyłączony i wysyła surowe żądanie otwarcia na 100%, nie żądając ogrzewania z centralnego kotła. Skonfigurowane ograniczenia sterowania zaworem mogą ograniczyć fizyczne otwarcie. Więcej informacji: [tryb uśpienia](documentation/pl/over-valve.md#tryb-uśpienia).
+
+## Wydanie 10.3.0
+Jednostki mocy można teraz konfigurować. Ekrany konfiguracji umożliwiają wybór jednostki dla pomiarów mocy (domyślnie W). Jednostki obliczonej energii są zgodne ze skonfigurowaną jednostką mocy. Istniejące wpisy są migrowane na podstawie historycznej wartości mocy urządzenia: wartości większe niż 100 są traktowane jako W, pozostałe jako kW.
+
+⚠️ **Ważna zmiana dla statystyk**
+Może pojawić się powiadomienie o naprawie, na przykład: `Jednostka „Central configuration Total power active for boiler” (sensor.total_power_active_for_boiler) została zmieniona na „kW”`, lub podobny wpis w logach. Jest to oczekiwane, ponieważ wcześniej jednostka nie była określona. Aby poprawić statystyki, wybierz akcję naprawy `Zaktualizuj jednostkę statystyk długoterminowych`.
+
+## Wydanie 10.2.0
+Funkcja **Auto Fan** jest teraz dostępna jako zewnętrzna wtyczka ([vtherm_auto_fan_extended](https://github.com/jmcollin78/vtherm_auto_fan_extended)). Oryginalna (_legacy_) wersja auto-fan jest nadal dostępna w _VTherm_, ale aby korzystać z wtyczki, musi zostać wyłączona w konfiguracji termostatu. Pełna dokumentacja jest dostępna w [repozytorium GitHub wtyczki](https://github.com/jmcollin78/vtherm_auto_fan_extended).
+
+## Wydanie 10.1
+Wybór trybu zatrzymania dla autoSTART/autoSTOP. Nowa encja `select` pozwala wybrać tryb stosowany, gdy funkcja autoSTART/autoSTOP wykryje warunek zatrzymania: `Wyłączony` (domyślnie), `Tylko wentylacja` lub `Osuszanie`. Tryby `Tylko wentylacja` i `Osuszanie` są proponowane tylko wtedy, gdy urządzenie podrzędne je obsługuje. Więcej informacji [tutaj](documentation/pl/feature-auto-start-stop.md).
+
+Samoregulacja jest teraz wyłączona, gdy _VTherm_ typu `over_climate` nie jest w trybie `Grzanie` lub `Chłodzenie`: do urządzenia podrzędnego wysyłana jest oryginalna (nieregulowana) temperatura zadana. Więcej informacji [tutaj](documentation/pl/self-regulation.md).
+
 ## Wydanie 10.0
 Wprowadzenie mechanizmu wtyczek. Umożliwia to korzystanie z zewnętrznych integracji jako wtyczek dla _VTherm_. Lista dostępnych wtyczek jest dostępna na stronie [Versatile Thermostat Web site](https://www.versatile-thermostat.org/pl/plugins).
 
-## Wydanie 9.3 - wersja stabilna
-> 1. **Wykrywanie zablokowanych zaworów**: Znaczne ulepszenie wykrywania awarii ogrzewania. Gdy anomalia zostanie wykryta na termostatach typu `over_climate_valve`, termostat diagnozuje teraz, czy problem jest spowodowany zablokowanym zaworem TRV (zablokowany otwarty lub zamknięty), porównując stan poleceń ze stanem rzeczywistym. Informacja ta - `root_cause` - jest wysyłana w zdarzeniu anomalii, umożliwiając podjęcie odpowiednich działań (powiadomienie, odzyskanie zaworu itp.). Więcej informacji [tutaj](documentation/pl/feature-heating-failure-detection.md),
-> 2. **Automatyczne ponowne zablokowanie po odblokowaniu**: Dodano parametr `auto_relock_sec` do funkcji blokady. Gdy jest skonfigurowany, termostat automatycznie się blokuje ponownie po określonej liczbie sekund po odblokowaniu. Tę funkcję można całkowicie wyłączyć, ustawiając wartość 0. Domyślnie automatyczne ponowne zablokowanie jest ustawione na 30 sekund dla zwiększonego bezpieczeństwa. Więcej informacji [tutaj](documentation/pl/feature-lock.md),
-> 3. **Ponowne wysyłanie poleceń**: Nowa funkcja do automatycznego wykrywania i korygowania rozbieżności między pożądanym stanem termostatu a rzeczywistym stanem urządzeń podrzędnych. Jeśli polecenie nie jest prawidłowo zastosowane do urządzenia, jest wysyłane ponownie. Zwiększa to niezawodność systemu w niestabilnych środowiskach lub z zawodnymi urządzeniami. Więcej informacji [tutaj](documentation/pl/feature-advanced.md),
-> 4. **Przywrócenie ustawienia czasowego po ponownym uruchomieniu**: Skonfigurowane ustawienie czasowe jest teraz prawidłowo przywracane po ponownym uruchomieniu termostatu lub Home Assistant. To ustawienie będzie działać normalnie po ponownym uruchomieniu. Więcej informacji [tutaj](documentation/pl/feature-timed-preset.md),
-> 5. **Zwiększona precyzja kontroli mocy**: Próg aktywacji kotła (`power_activation_threshold`) akceptuje teraz wartości dziesiętne (0,1, 0,5 itp.) dla dokładniejszej kontroli mocy aktywacji. Zapewnia to większą elastyczność w optymalizacji zużycia energii. Więcej informacji [tutaj](documentation/pl/feature-power.md),
-> 6. **Ulepszenia dostępności czujników**: Lepsza obsługa określania dostępności czujnika temperatury przy użyciu metadanych `last_updated` Home Assistant, ulepszone wykrywanie utraty sygnału czujnika,
 
-## Wydanie 9.2
-> 1. Nowy sposób zarządzania cyklami ogrzewania/zatrzymania dla VTherm `na przełączniku`. Obecny algorytm ma pewną zwłokę czasową, a pierwsze cykle nie są optymalne. To zaburza TPI i w szczególności algorytm auto-TPI. Nowy `Terminarz cykli` rozwiązuje te niedogodności. Ta zmiana jest dla Ciebie całkowicie przezroczysta.
-> 2. Kolektor dzienników. Twoje żądania wsparcia często zawodzą ze względu na brak możliwości dostarczenia dzienników w odpowiednim okresie, skoncentrowanych na termostacie z błędem i na właściwym poziomie dziennika. To kwestia błędów szczególnie trudno reprodukowalnych. Kolektor dzienników ma na celu rozwiązanie tego problemu. Zbiera on dzienniki w tle na maksymalnym poziomie szczegółowości, a akcja (dawniej usługa) umożliwia ich wyodrębnienie do pliku. Można je pobrać i dołączyć do żądania wsparcia. Analizator dzienników powiązany ze stroną internetową - uruchomiony w wersji 9.1 (patrz poniżej) - dostosowuje się tak, aby mógł przetwarzać te dzienniki. Więcej informacji na temat kolektora dzienników [tutaj](documentation/pl/feature-logs-collector.md).
-> 3. Stabilizacja wersji 9.x. Wersja główna 9 przyniosła wiele zmian, które spowodowały kilka anomalii. Ta wersja zawiera ostatnie poprawki związane z wersją 9.
-
-## Wydanie 9.1
-> 1. Nowe logo. Zainspirowane pracami @Krzysztonek (zobacz [tutaj](https://github.com/jmcollin78/versatile_thermostat/pull/1598)), VTherm korzysta z nowej funkcji wprowadzonej w [HA 2026.03](https://developers.home-assistant.io/blog/2026/02/24/brands-proxy-api/), aby zmienić swoje logo. Cały zespół ma nadzieję, że nowa wersja przypadnie Wam do gustu. Miłego korzystania!
-> 2. Strona internetowa stworzona przez @bontiv rozwiązuje jeden z głównych problemów VTherm: dokumentację. Strona umożliwia także analizę logów! Przekaż swoje logi (w trybie debug), a będziesz mógł je analizować, przybliżać widok dla konkretnego termostatu, wybranego okresu, filtrować interesujące dane itd. Zachęcamy do odkrycia tej pierwszej wersji tutaj: [Versatile Thermostat Web site](https://www.versatile-thermostat.org/). Ogromne podziękowania dla @bontiv za tę świetną realizację.
-> 3. Oficjalna publikacja funkcji auto-TPI. Funkcja ta oblicza optymalne wartości współczynników dla algorytmu [TPI](documentation/fr/algorithms.md#lalgorithme-tpi). Warto podkreślić niesamowitą pracę @KipK oraz @gael1980 w tym zakresie. Jeśli chcesz z niej korzystać, koniecznie przeczytaj dokumentację.
-> 4. VTherm opiera się teraz na stanie raportowanym przez urządzenia podrzędne w HA. Dopóki wszystkie urządzenia podrzędne nie mają znanego stanu w HA, VTherm pozostaje wyłączony.
 
 ## 🍻 Dziękuję za piwo! 🍻
 [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/jmcollin78)
@@ -148,7 +171,7 @@ Dla wygody Użytkownika, a także w celu dostępu do pomocy kontekstowej podczas
 
 # ⭐ Historia gwiazdek
 
-[![Star History Chart](https://api.star-history.com/svg?repos=jmcollin78/versatile_thermostat&type=Date)](https://star-history.com/#jmcollin78/versatile_thermostat&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=jmcollin78/versatile_thermostat&type=Date)](https://star-history.dera.page/#jmcollin78/versatile_thermostat&Date)
 
 ## Współpraca mile widziana!
 
