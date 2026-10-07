@@ -72,3 +72,20 @@ longer overwrites what the next run restores. When this happens, the log shows:
 
 Covered by `test_over_climate_restore_after_interrupted_start` and
 `test_over_climate_carries_last_state_until_started` in `tests/test_start.py`.
+
+## Setpoints outside the underlying's reported range (fork fix)
+
+Home Assistant rejects a `target_temp_low` / `target_temp_high` outside the
+underlying entity's `min_temp` / `max_temp`. Some devices report only the range of
+the side that is currently active: an Airzone Aidoo PRO in `heat_cool` reports
+67–87 °F while cooling, even though it heats down to 63 °F (`heatmintemp`). See
+home-assistant/core#160887.
+
+The passthrough used to clamp both bounds into that range, so a 63/67 request was
+sent as 67/67. The Aidoo then raised cool to 70 to keep its deadband, and the two
+setpoints flapped every cycle. Now, when a bound doesn't fit the reported range,
+the passthrough sends nothing and retries on the next cycle. Once the range
+accepts both bounds, it sends them unchanged. The device keeps its previous
+setpoints in the meantime.
+
+Covered by `tests/test_dual_setpoint.py`.

@@ -931,26 +931,39 @@ class UnderlyingClimate(UnderlyingEntity):
             return
 
         # If the underlying does not support a range, degrade to single setpoint.
-        if ClimateEntityFeature.TARGET_TEMPERATURE_RANGE not in self.supported_features:
+        # Bitwise test: supported_features can be a plain int (see bug #2003).
+        if not self.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE:
             fallback = temp_high if temp_high is not None else temp_low
             if fallback is not None:
                 await self.set_temperature(fallback, None, None)
             return
 
-        clamped_high = self.clamp_sent_value(temp_high) if temp_high is not None else None
-        clamped_low = self.clamp_sent_value(temp_low) if temp_low is not None else None
-
         # Skip the service call if nothing changed since the last send. The control
         # cycle calls this every tick; the underlying handles the deadband itself.
-        if clamped_high == self._last_sent_temp_high and clamped_low == self._last_sent_temp_low:
-            _LOGGER.debug("%s - dual setpoints unchanged (high=%s low=%s). Skip send.", self, clamped_high, clamped_low)
+        if temp_high == self._last_sent_temp_high and temp_low == self._last_sent_temp_low:
+            _LOGGER.debug("%s - dual setpoints unchanged (high=%s low=%s). Skip send.", self, temp_high, temp_low)
+            return
+
+        # Home Assistant rejects a bound outside the underlying min_temp/max_temp, and some devices
+        # only report the range of the side that is active: an Airzone Aidoo reports 67-87 while
+        # cooling although it heats down to 63. Clamping would overwrite the other side's setpoint
+        # and can collapse the deadband (63/67 sent as 67/67), so wait for a range that fits both.
+        if not self._is_in_underlying_range(temp_high) or not self._is_in_underlying_range(temp_low):
+            _LOGGER.info(
+                "%s - dual setpoints high=%s low=%s are outside the underlying range %s-%s. Waiting for the range to accept them",
+                self,
+                temp_high,
+                temp_low,
+                self.min_temp,
+                self.max_temp,
+            )
             return
 
         data = {ATTR_ENTITY_ID: self._entity_id}
-        if clamped_high is not None:
-            data["target_temp_high"] = clamped_high
-        if clamped_low is not None:
-            data["target_temp_low"] = clamped_low
+        if temp_high is not None:
+            data["target_temp_high"] = temp_high
+        if temp_low is not None:
+            data["target_temp_low"] = temp_low
 
         _LOGGER.info("%s - Set dual setpoints: %s", self, data)
 
@@ -964,8 +977,14 @@ class UnderlyingClimate(UnderlyingEntity):
             _LOGGER.error("%s - Error while sending set_temperature_range: %s", self, ex)
             raise ex
 
-        self._last_sent_temp_high = clamped_high
-        self._last_sent_temp_low = clamped_low
+        self._last_sent_temp_high = temp_high
+        self._last_sent_temp_low = temp_low
+
+    def _is_in_underlying_range(self, value: float | None) -> bool:
+        """True if the underlying accepts this setpoint now (or reports no range)"""
+        if value is None or self.min_temp is None or self.max_temp is None:
+            return True
+        return self.min_temp <= value <= self.max_temp
 
     @property
     def last_sent_temperature(self) -> float | None:
