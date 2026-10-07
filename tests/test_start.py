@@ -4,10 +4,14 @@
 from unittest.mock import patch, call, MagicMock
 from datetime import datetime, timedelta
 
-from homeassistant.core import HomeAssistant
-from homeassistant.components.climate.const import HVACAction
+from homeassistant.core import HomeAssistant, State
+from homeassistant.components.climate.const import HVACAction, HVACMode
 
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    mock_restore_cache,
+    mock_restore_cache_with_extra_data,
+)
 
 from custom_components.versatile_thermostat.base_thermostat import BaseThermostat
 from custom_components.versatile_thermostat.thermostat_climate import (
@@ -20,6 +24,8 @@ from custom_components.versatile_thermostat.thermostat_valve import (
     ThermostatOverValve,
 )
 from custom_components.versatile_thermostat.vtherm_hvac_mode import VThermHvacMode
+from custom_components.versatile_thermostat.vtherm_state import VThermState
+from custom_components.versatile_thermostat.const import ATTR_CURRENT_STATE, ATTR_REQUESTED_STATE, ATTR_PENDING_RESTORE_STATE
 
 from .commons import *  # pylint: disable=wildcard-import, unused-wildcard-import
 
@@ -125,7 +131,8 @@ async def test_over_climate_full_start(hass: HomeAssistant, skip_hass_states_is_
         assert entity.have_valve_regulation is False
 
         # hvac_modes comes from underlying entity + OFF. there is no AC mode in underlying entity
-        assert entity.vtherm_hvac_modes == [VThermHvacMode_HEAT, VThermHvacMode_OFF, VThermHvacMode_COOL]
+        # Dual-setpoint fork: HEAT_COOL is kept (passthrough) and COOL is added next to it
+        assert entity.vtherm_hvac_modes == [VThermHvacMode_HEAT, VThermHvacMode_OFF, VThermHvacMode_HEAT_COOL, VThermHvacMode_COOL]
 
         # should have been called with EventType.PRESET_EVENT and EventType.HVAC_MODE_EVENT
         assert mock_send_event.call_count == 2
@@ -464,7 +471,7 @@ async def test_over_climate_start_heating(hass: HomeAssistant, skip_hass_states_
 
     # Enable heating mode
     await entity.async_set_hvac_mode(VThermHvacMode_HEAT)
-    assert entity.vtherm_hvac_mode is VThermHvacMode_HEAT
+    assert entity.vtherm_hvac_mode == VThermHvacMode_HEAT
 
     # Set a target temperature and send a low current temperature
     await entity.async_set_preset_mode(VThermPreset.BOOST)
@@ -559,5 +566,67 @@ async def test_over_valve_start_heating(hass: HomeAssistant, skip_hass_states_is
 
     # Check that VTherm hvac_action is HEATING
     assert entity.hvac_action is HVACAction.HEATING, "VTherm should be in HEATING action"
+
+    entity.remove_thermostat()
+
+
+def _vtherm_saved_state(hvac_mode: HVACMode, vtherm_state: VThermState) -> State:
+    """A VTherm state as Home Assistant saves it for restoration"""
+    return State(
+        "climate.theoverclimatemockname",
+        hvac_mode,
+        {ATTR_CURRENT_STATE: vtherm_state.to_dict(), ATTR_REQUESTED_STATE: vtherm_state.to_dict()},
+    )
+
+
+async def test_over_climate_restore_after_interrupted_start(hass: HomeAssistant, skip_hass_states_is_state):
+    """A HA run stopped before the VTherm was started saves the VTherm default OFF state. The next
+    start must restore the state saved before that run instead of coming back OFF"""
+    heat_state = _vtherm_saved_state(HVACMode.HEAT, VThermState(hvac_mode=VThermHvacMode_HEAT, preset=VThermPreset.NONE, target_temperature=19))
+    default_state = _vtherm_saved_state(HVACMode.OFF, VThermState(hvac_mode=VThermHvacMode_OFF, preset=VThermPreset.NONE))
+    mock_restore_cache_with_extra_data(hass, [(default_state, {ATTR_PENDING_RESTORE_STATE: heat_state.as_dict()})])
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="TheOverClimateMockName",
+        unique_id="uniqueId",
+        data=PARTIAL_CLIMATE_CONFIG,
+    )
+    await create_and_register_mock_climate(hass, "mock_climate", "MockClimateName", {}, hvac_modes=[VThermHvacMode_HEAT, VThermHvacMode_OFF])
+
+    entity = await create_thermostat(hass, entry, "climate.theoverclimatemockname")
+    await wait_for_local_condition(lambda: entity.is_ready is True)
+
+    assert entity.vtherm_hvac_mode == VThermHvacMode_HEAT
+    assert entity.target_temperature == 19
+    assert entity.hvac_off_reason is None
+    # The restored state is published, so there is nothing left to carry over
+    assert entity.extra_restore_state_data is None
+
+    entity.remove_thermostat()
+
+
+async def test_over_climate_carries_last_state_until_started(hass: HomeAssistant, skip_hass_states_is_state):
+    """Until the VTherm is started it shows its default OFF state, so it must hand the last saved
+    state to the next run in case HA stops before the VTherm is started"""
+    heat_state = _vtherm_saved_state(HVACMode.HEAT, VThermState(hvac_mode=VThermHvacMode_HEAT, preset=VThermPreset.NONE, target_temperature=19))
+    mock_restore_cache(hass, [heat_state])
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="TheOverClimateMockName",
+        unique_id="uniqueId",
+        data=PARTIAL_CLIMATE_CONFIG,
+    )
+    await create_and_register_mock_climate(hass, "mock_climate", "MockClimateName", {}, hvac_modes=[VThermHvacMode_HEAT, VThermHvacMode_OFF])
+
+    # HA stops before EVENT_HOMEASSISTANT_STARTED, so the VTherm is never started
+    with patch("custom_components.versatile_thermostat.base_thermostat.BaseThermostat.async_startup"):
+        entity = await create_thermostat(hass, entry, "climate.theoverclimatemockname")
+
+    assert entity.vtherm_hvac_mode is VThermHvacMode_OFF
+    carried_state = State.from_dict(entity.extra_restore_state_data.as_dict()[ATTR_PENDING_RESTORE_STATE])
+    assert carried_state.state == HVACMode.HEAT
+    assert carried_state.attributes[ATTR_CURRENT_STATE] == heat_state.attributes[ATTR_CURRENT_STATE]
 
     entity.remove_thermostat()

@@ -561,6 +561,7 @@ CENTRAL_MODES = [
 
 ATTR_CURRENT_STATE = "current_state"
 ATTR_REQUESTED_STATE = "requested_state"
+ATTR_PENDING_RESTORE_STATE = "pending_restore_state"
 
 MSG_OVERPOWERING_DETECTED = "overpowering_detected"
 MSG_SAFETY_DETECTED = "safety_detected"

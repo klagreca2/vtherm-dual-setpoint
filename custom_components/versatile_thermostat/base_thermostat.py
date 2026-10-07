@@ -22,6 +22,8 @@ from homeassistant.exceptions import HomeAssistantError
 
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.helpers.restore_state import (
+    ExtraStoredData,
+    RestoredExtraData,
     RestoreEntity,
     async_get as restore_async_get,
 )
@@ -121,6 +123,8 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         self._enable_turn_on_off_backwards_compatibility = False
         self._is_removed = False
         self._is_startup_done = False
+        # Last good saved state, kept until it has been restored and published (see extra_restore_state_data)
+        self._pending_restore_state: State | None = None
 
         self._hass = hass
         self._entry_infos = None
@@ -501,8 +505,33 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
 
         self.async_on_remove(self.remove_thermostat)
 
+        # Until async_startup runs (on EVENT_HOMEASSISTANT_STARTED) this entity only shows its
+        # default OFF state. If HA stops before that, HA saves that default as our last state and
+        # the next start restores OFF and turns the underlyings off. So keep the last good state
+        # and hand it over through extra_restore_state_data until it has been restored.
+        self._pending_restore_state = await self._async_get_last_good_state()
+
         # issue 428. Link to others entities will start at link
         # await self.async_startup()
+
+    @property
+    def extra_restore_state_data(self) -> ExtraStoredData | None:
+        """Carry the last good state over a run that stopped before restoring it"""
+        if self._pending_restore_state is None:
+            return None
+        return RestoredExtraData({ATTR_PENDING_RESTORE_STATE: self._pending_restore_state.as_dict()})
+
+    async def _async_get_last_good_state(self) -> State | None:
+        """Get the last saved state, or the one carried over by a run stopped before this VTherm was started"""
+        if (extra_data := await self.async_get_last_extra_data()) is not None:
+            if pending_state := State.from_dict(extra_data.as_dict().get(ATTR_PENDING_RESTORE_STATE)):
+                _LOGGER.warning(
+                    "%s - previous run stopped before this VTherm was started. Restoring the state saved before it (%s)",
+                    self,
+                    pending_state.state,
+                )
+                return pending_state
+        return await self.async_get_last_state()
 
     async def async_will_remove_from_hass(self):
         """Try to force backup of entity"""
@@ -663,6 +692,8 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         await self.update_states(force=True)
         self._persist_energy_unit_if_needed()
         self.recalculate()
+        # The restored state is now published, so HA saves it by itself from now on
+        self._pending_restore_state = None
 
         # check initial state should be done after the current state has been calculated and so after the manager has been updated
         # issue 1654 - initial state check should be done after the underlyings has come to life
@@ -694,7 +725,7 @@ class BaseThermostat(ClimateEntity, RestoreEntity, Generic[T]):
         self._energy_unit_needs_persistence = False
 
         # Check If we have an old state
-        old_state = await self.async_get_last_state()
+        old_state = self._pending_restore_state or await self.async_get_last_state()
         _LOGGER.debug(
             "%s - Calling get_my_previous_state old_state is %s", self, old_state
         )

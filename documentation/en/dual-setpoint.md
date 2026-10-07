@@ -53,3 +53,22 @@ The change is intentionally small and contained:
   range properties report VTherm state in `heat_cool`.
 - `underlyings.py` — `UnderlyingClimate.set_temperature_range()` sends the two
   setpoints, with change-detection to avoid spamming the device each cycle.
+
+## Restore after an interrupted start (fork fix)
+
+Upstream VTherm only restores its saved state once Home Assistant fires
+`EVENT_HOMEASSISTANT_STARTED`. Until then the entity shows its default `off`
+state. If Home Assistant is stopped during that window (for example a second
+restart, or a Core update, issued while the first restart is still booting),
+Home Assistant saves that default `off` as the VTherm's last state. The next start
+then restores `off`, marks it `hvac_off_manual` and turns the underlying climate off.
+
+The fork keeps the last good saved state from `async_added_to_hass` until the
+restored state has been published, and hands it to the next run through
+`extra_restore_state_data`. A run that never got to start the VTherm therefore no
+longer overwrites what the next run restores. When this happens, the log shows:
+
+    <name> - previous run stopped before this VTherm was started. Restoring the state saved before it (<state>)
+
+Covered by `test_over_climate_restore_after_interrupted_start` and
+`test_over_climate_carries_last_state_until_started` in `tests/test_start.py`.

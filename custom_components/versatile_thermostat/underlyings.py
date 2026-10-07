@@ -653,8 +653,6 @@ class UnderlyingClimate(UnderlyingEntity):
                     current_state.target_temperature_low,
                 )
 
-            if self._cancel_set_temperature_later:
-                self._cancel_set_temperature_later()
             self._cancel_set_temperature_later = async_call_later(self._hass, resend_delay_sec, callback_resend_range)
 
         return True

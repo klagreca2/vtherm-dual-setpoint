@@ -69,6 +69,9 @@ async def test_state_manager_create(
        "hvac_mode": str(VThermHvacMode_HEAT),
        "preset": str(VThermPreset.ECO),
        "target_temperature": 22,
+       # Dual-setpoint fork: HEAT_COOL high/low bounds
+       "target_temperature_high": None,
+       "target_temperature_low": None,
     }
 
     json["hvac_mode"] = str(VThermHvacMode_COOL)
